@@ -14,32 +14,6 @@
     NOTE: REQUIRES PS6 or greater due to Remote PSSessions and SSL download
     OPTIONAL: Run with ChangeRBSCredentialOnly switch at CLI to change user/pw on existing RBS installs only (no install)
 
-.PARAMETER RubrikCluster
-    Name or IP of Rubrik Cluster to download the RBS from
-
-.PARAMETER ComputerName
-    List of comma separated host FQDN to install RBS on.
-
-.PARAMETER RBSCredential
-    PSCredential of service account username/password to use on remote computer for RBS Service
-
-.PARAMETER RBSUserName
-    Username of service account to use on remote computer for RBS Service
-    Username can be "LocalSystem" to run as default system instead of a domain service account (Will not prompt for password)
-
-.PARAMETER RBSPassword
-    Password of service account to use on remote computer for RBS Service (WARNING: Cleartext on commandline and in PS History--use carefully)
-    When using Group Service Managed Accounts (gMSA), omit this CLI argument and it will prompt for pw. Press enter to leave password empty. 
-
-.PARAMETER ChangeRBSCredentialOnly
-    CLI switch to signal to only change user/pw on server. Does not download/copy/install RBS. 
-
-.PARAMETER OpenWindowsFirewall
-    CLI switch to signal to open ports 12800/12801TCP for RBS.  
-
-.PARAMETER Path
-    Location to download and extract RBS to. Default C:\Temp
-
 .NOTES
     Updated 2023.08.26 by David Oslager for community usage
     GitHub: doslagerRubrik
@@ -71,13 +45,13 @@
 #Requires -version 6.0
 [CmdletBinding()]                                # <-- Verbose and Debug enabled with the [CmdletBinding()] directive
 param(
-    # Rubrik Cluster name or ip address
+    #Rubrik Cluster name or ip address
     [string]$RubrikCluster,
     
-    # Computer(s) that should have the Rubrik Backup Service installed onto and then added into Rubrik
+    #Comma separated list of computer(s) that should have the Rubrik Backup Service installed onto and then added into Rubrik 
     [String]$ComputerName,
 
-    # Credential to run the Rubrik Backup Service on the Computer
+    #Credential to run the Rubrik Backup Service on the Computer
     [pscredential]$RBSCredential,
 
     #Username to connect with. If RBSPassword not included on command line, will prompt for password (Secure!)
@@ -89,7 +63,7 @@ param(
     #Skip RBS install, change RBS user/pw only
     [switch]$ChangeRBSCredentialOnly,
 
-    #Open Windows Firewall ports (12800/12801 TCP)
+    #Create rule to Open Windows Firewall ports (12800/12801 TCP)
     [switch]$OpenWindowsFirewall,
 
     #Local Location to store download of RBS
