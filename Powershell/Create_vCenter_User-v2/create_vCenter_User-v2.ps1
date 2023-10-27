@@ -41,7 +41,7 @@ create_vCenter_User.ps1 -vCenter <vcenter_server> -RubrikServiceAccount <usernam
 
 Create the restricted permissions in an AVS vCenter and prompt for the vCenter username and password.
 #>
-
+#
 param (
   [CmdletBinding()]
 
