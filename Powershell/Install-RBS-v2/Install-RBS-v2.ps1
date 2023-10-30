@@ -15,6 +15,11 @@
     OPTIONAL: Run with ChangeRBSCredentialOnly switch at CLI to change user/pw on existing RBS installs only (no install)
 
     OPTIONAL: Can connect to RSC and automatically add host to specified cluster. Requires RSC service account JSON file
+    - Connect to RSC using specified RSC Service Account JSON File
+    - Queries list of connected clusters matching "RubrikCluster" string
+    - If no matches, exit
+    - If multiple matches, prompt for which cluster
+    - If using RSC method, RBS download will be from the IP of the first node in the cluster
 
 .NOTES
     Updated 2023.08.26 by David Oslager for community usage
@@ -42,6 +47,12 @@
     Install-RBS-v2.ps1 -RubrikCluster rubrik01.domain.com -RBSCredential $RBSCredential
 
     Install RBS from Cluster "rubrik01.domain.com" using specified PSCredential Variable (must be defined, or will prompt for user/pw)
+
+.EXAMPLE
+    Install-RBS-v2.ps1 -RubrikCluster rubrik01 -RBSCredential $RBSCredential -RSCserviceAccountJSON .\path\to\SvcAcct.JSON
+
+    Connect to RSC and verify cluster name in RSC and it's connected. Then download RBS from IP of first node in cluster "rubrik01"
+    and install RBS with RunAs using specified PSCredential Variable (must be defined, or will prompt for user/pw)
 
 #>
 #Requires -version 6.0
@@ -377,10 +388,22 @@ Function Set-ServiceRunAs {
 & $CreateLogFolder_scriptBlock
 & $HeaderBlock_scriptBlock
 
+
+#prompt for RSCServiceAccountJSON
+If ($RSCserviceAccountJSON) {
+    Write-MyLogger "RSCserviceAccountJSON specified opn command line: $RSCserviceAccountJSON" GREEN
+} else {
+    Write-MyLogger "No RSCserviceAccountJSON Specified on Command Line." Yellow -NoTimeStamp
+    Write-MyLogger "  Enter path to RSC JSON file to automatically add the windows host to RSC," Yellow -NoTimeStamp
+    Write-MyLogger "  or leave blank to continue to skip RSC and automatic registration" Yellow -NoTimeStamp
+    $RSCserviceAccountJSON = Read-Host -Prompt "Please enter path to RSC Svc Acct JSON file"
+    write-host
+}
+
 #Region RubrikCluster
 if ($ChangeRBSCredentialOnly) {
     Write-MyLogger "Change RBS Credential Only specified on command line. Skipping RBS download" GREEN
-} elseif ($RSCserviceAccountJSON) {
+} elseif ($null -ne $RSCserviceAccountJSON -and $RSCserviceAccountJSON -ne "") {
     #connect to RSC
     #################################################################################################
     #Region Connect to RSC, create Splat of common params
@@ -551,7 +574,7 @@ if ($ComputerName) {
 #Region User/Pw/Creds
 if ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
     #Credential supplied via command line and var type is a PSCredential
-    Write-MyLogger "Credential specified. (user: $($RBSCredential.UserName)" CYAN
+    Write-MyLogger "Credential specified. (user: $($RBSCredential.UserName))" CYAN
 } elseif ( $RBSCredential ) {
     #Variable is defined, but not a proper PScredential - Ignore and re-prompt
     Write-MyLogger "Credential entered on CLI, but not a proper PScredential. Prompting for credential" CYAN -NoTimeStamp
