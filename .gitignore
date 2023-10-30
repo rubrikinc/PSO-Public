@@ -1,11 +1,13 @@
 /*/*.cred
 /bin
 /Testing
-/*/zzTesting
-/zzTesting
+**/zzTesting/**
+**/zzTesting/*
+**/zzTesting
 /zzArchive
 /.DS_Store
 /.vscode
 /Logs
 /*/Logs
 *stuff*
+/PowerShell/*/zzTesting
