@@ -1,7 +1,7 @@
 /*/*.cred
 /bin
 /Testing
-/*/zzTesting
+**/zzTesting/**
 /zzTesting
 /zzArchive
 /.DS_Store
