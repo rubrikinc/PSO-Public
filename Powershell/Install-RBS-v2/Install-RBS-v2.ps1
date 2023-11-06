@@ -344,40 +344,6 @@ function New-Host(){
 } #End Function New-Host
 
 
-Function DEPRECATED_Restart-RBS {
-    Param (
-        [string]$computer
-    )
-    #Region Restarting Service on remote computer
-    Start-Sleep 5
-    Write-MyLogger "Restarting RBS service on $computer" Cyan
-    try {
-        Invoke-Command -ComputerName $Computer -ScriptBlock { 
-            get-service "rubrik backup service" | Stop-Service 
-            Start-Sleep 2
-            get-service "rubrik backup service" | Start-Service
-        }
-    } catch {
-        Write-MyLogger "ERROR! Could not restart service properly on $Computer. Please check manually"
-        continue
-    }
-    #EndRegion Restarting Service on remote computer        
-}
-
-Function DEPRECATED_Set-ServiceRunAs {
-    Param (
-        [string]$Computer,
-        [string]$RBSUserName,
-        [string]$RBSPassword
-    )
-    Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
-    try {
-        Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
-    } catch {
-        Write-MyLogger "ERROR! Did not set the username $RBSUserName properly on $Computer. Please check manually"
-        continue
-    }        
-}
 #EndRegion Functions
 
 
@@ -658,18 +624,6 @@ if (-not $ChangeRBSCredentialOnly) {
 }
 #endregion
 
-# #Region Validate the Servername(s) and if it is online
-# Write-MyLogger "Testing connectivity to each target server. Please wait." CYAN
-# $ValidComputerList=@()
-# foreach( $Computer in $($ComputerName -split ',') ) {
-#     if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
-#         Write-MyLogger "$Computer is reachable - will attempt to install/modify RBS" GREEN
-#         $ValidComputerList +=$Computer
-#     } else {
-#         Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
-#     }  
-# }
-# #EndRegion Validate the Servername(s) and if it is online
 
 
 
@@ -682,7 +636,6 @@ foreach($Computer in $($ComputerName -split ',')){
         Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
     } else {
         Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
-
         continue
     }  
 
@@ -874,7 +827,6 @@ foreach($Computer in $($ComputerName -split ',')){
         Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
     } else {
         #Set Service to run as RBSUserName/RBSPassword
-        #Set-ServiceRunAs -Computer $Computer -RBSUserName $RBSUserName -RBSPassword $RBSPassword
         Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
         try {
             Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
@@ -883,7 +835,6 @@ foreach($Computer in $($ComputerName -split ',')){
             continue
         }        
         #Restart RBS for new credentials to take effect
-        #Restart-RBS -computer $Computer
         Start-Sleep 5
         Write-MyLogger "Restarting RBS service on $computer" Cyan
         try {
