@@ -755,7 +755,7 @@ foreach($Computer in $ValidComputerList){
             Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
             continue
         }
-        #EndRegion Restarting Service on remote computer
+        #EndRegion adding username to administrators on remote computer
 
 
         #Region Setting SeServiceLoginRight on remote computer to allow run as a service
@@ -837,7 +837,7 @@ foreach($Computer in $ValidComputerList){
                     LocalPort    = @(12800, 12801)
                 }
                 if ( Get-NetFirewallRule | Where-Object { $_.displayname -match $RBSFirewallRule.DisplayName } ){
-                    Write-Host "  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
+                    Write-Host "$using:LineIndentSpaces  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
                 } else {
                     $result = New-NetFirewallRule @RBSFirewallRule
                 }
