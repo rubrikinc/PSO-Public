@@ -58,7 +58,7 @@
 #Requires -version 6.0
 [CmdletBinding()]                                # <-- Verbose and Debug enabled with the [CmdletBinding()] directive
 param(
-    #Rubrik Cluster name or ip address
+    #Rubrik Cluster name (must match RSC name) or ip address (only if not adding to RSC) or Cluster UUID
     [string]$RubrikCluster,
     
     #Comma separated list of computer(s) that should have the Rubrik Backup Service installed onto and then added into Rubrik 
@@ -344,7 +344,7 @@ function New-Host(){
 } #End Function New-Host
 
 
-Function Restart-RBS {
+Function DEPRECATED_Restart-RBS {
     Param (
         [string]$computer
     )
@@ -364,7 +364,7 @@ Function Restart-RBS {
     #EndRegion Restarting Service on remote computer        
 }
 
-Function Set-ServiceRunAs {
+Function DEPRECATED_Set-ServiceRunAs {
     Param (
         [string]$Computer,
         [string]$RBSUserName,
@@ -448,8 +448,14 @@ if ($ChangeRBSCredentialOnly) {
             connectionState = "Connected"
             excludeId       = "00000000-0000-0000-0000-000000000000"
         }
-
     }
+
+    if ($RubrikCluster -match $ValidGUIDRegex) {
+        Write-MyLogger "Rubrik Cluster name matches GUID. Searching by ID instead of name" Yellow
+        $variables.filter.remove("name")
+        $variables.filter.add("id",$RubrikCluster)
+    }
+
     #Endregion QueryString and Vars
     $Payload = @{
         query     = $QueryString
@@ -457,7 +463,6 @@ if ($ChangeRBSCredentialOnly) {
     }
     $RSCRubrikClusters_temp = Get-RSCRubrikData -Payload $Payload -QueryDescription "list of Rubrik Clusters"
     Write-MyLogger "Verifying cluster is in RSC: "
-    #$RSCRubrikClusters = $RSCRubrikClusters_temp | Select Name, DefaultAddress, Status, @{N="UUID";E={$_.id}}, @{N="IPAddress"; E={$_.clusterNodeConnection.Nodes.ipAddress}}
     $RSCRubrikClusters = @()
     foreach ($RSCRubrikCluster_temp in $RSCRubrikClusters_temp) {
         $RSCRubrikCluster = New-Object -Type PSObject
@@ -489,10 +494,15 @@ if ($ChangeRBSCredentialOnly) {
     }
 
     if ($RscRubrikClusters.count -eq 0) {
-        Write-myLogger "Error! No cluster found matching the name ""$RubrikCluster"". Please verify and try again" RED
+        Write-myLogger "Error! No cluster found matching the name/ID ""$RubrikCluster"". Please verify and try again" RED
         exit
     } elseif ($RSCRubrikClusters.count -eq 1) {
-        Write-MyLogger "Found Cluster named ""$RubrikCluster"""
+        if ($RubrikCluster -match $ValidGUIDRegex) {
+            Write-MyLogger "Found Cluster with ID $RubrikCluster and name of $($RSCRubrikClusters.Name)"
+            $RubrikCluster = $RSCRubrikClusters.Name
+        } else {
+            Write-MyLogger "Found Cluster named ""$RubrikCluster"""
+        }
         $RubrikClusterObject = $RSCRubrikClusters
     } else {
         if ($RubrikCluster) {
@@ -596,7 +606,7 @@ if ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
 } else {
     #Nothing supplied - prompt for user/pw
     Write-MyLogger "User/Password not specified on CLI...prompting for credential." Cyan -NoTimeStamp
-    Write-MyLogger "  > NOTE: Enter ""LocalSystem"" with a blank password for default"  Cyan -NoTimeStamp
+    Write-MyLogger "  > NOTE: For default of ""LocalSystem"" enter ""LocalSystem"" with a blank password"  Cyan -NoTimeStamp
     Write-MyLogger "  > NOTE: For gMSA accounts, enter DOMAIN\UserName with a blank password" Cyan -NoTimeStamp
     $RBSCredential = Get-Credential -title "Enter user name and password for the service account that will run the Rubrik Backup Service" 
 }
@@ -645,29 +655,37 @@ if (-not $ChangeRBSCredentialOnly) {
     $progressPreference = $oldProgressPreference 
     Write-MyLogger "Expanding RBS locally to c:\Temp\RubrikBackupService\" CYAN
     Expand-Archive -LiteralPath $OutFile -DestinationPath "$path\RubrikBackupService" -Force
-    Write-MyLogger $LineSepDashes
 }
 #endregion
 
-#Region Validate the Servername(s) and if it is online
-Write-MyLogger "Testing connectivity to each target server. Please wait." CYAN
-$ValidComputerList=@()
-foreach( $Computer in $($ComputerName -split ',') ) {
-    if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
-        Write-MyLogger "$Computer is reachable - will attempt to install/modify RBS" GREEN
-        $ValidComputerList +=$Computer
-    } else {
-        Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
-    }  
-}
-#EndRegion Validate the Servername(s) and if it is online
+# #Region Validate the Servername(s) and if it is online
+# Write-MyLogger "Testing connectivity to each target server. Please wait." CYAN
+# $ValidComputerList=@()
+# foreach( $Computer in $($ComputerName -split ',') ) {
+#     if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
+#         Write-MyLogger "$Computer is reachable - will attempt to install/modify RBS" GREEN
+#         $ValidComputerList +=$Computer
+#     } else {
+#         Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
+#     }  
+# }
+# #EndRegion Validate the Servername(s) and if it is online
 
 
 
 ##############################################################################################################
 #Region Loop Through Computer List
-foreach($Computer in $ValidComputerList){
+foreach($Computer in $($ComputerName -split ',')){
     Write-MyLogger $LineSepDashes
+    Write-MyLogger "Testing connectivity to $Computer. Please wait." CYAN
+    if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
+        Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
+    } else {
+        Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
+
+        continue
+    }  
+
     if ($ChangeRBSCredentialOnly){
         Write-MyLogger "Changing RBS Password on " CYAN -NoNewline 
     } else {
@@ -755,7 +773,7 @@ foreach($Computer in $ValidComputerList){
             Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
             continue
         }
-        #EndRegion Restarting Service on remote computer
+        #EndRegion adding username to administrators on remote computer
 
 
         #Region Setting SeServiceLoginRight on remote computer to allow run as a service
@@ -837,7 +855,7 @@ foreach($Computer in $ValidComputerList){
                     LocalPort    = @(12800, 12801)
                 }
                 if ( Get-NetFirewallRule | Where-Object { $_.displayname -match $RBSFirewallRule.DisplayName } ){
-                    Write-Host "  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
+                    Write-Host "$using:LineIndentSpaces  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
                 } else {
                     $result = New-NetFirewallRule @RBSFirewallRule
                 }
@@ -856,10 +874,28 @@ foreach($Computer in $ValidComputerList){
         Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
     } else {
         #Set Service to run as RBSUserName/RBSPassword
-        Set-ServiceRunAs -Computer $Computer -RBSUserName $RBSUserName -RBSPassword $RBSPassword
-
+        #Set-ServiceRunAs -Computer $Computer -RBSUserName $RBSUserName -RBSPassword $RBSPassword
+        Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
+        try {
+            Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
+        } catch {
+            Write-MyLogger "ERROR! Did not set the username $RBSUserName properly on $Computer. Please check manually"
+            continue
+        }        
         #Restart RBS for new credentials to take effect
-        Restart-RBS -computer $Computer
+        #Restart-RBS -computer $Computer
+        Start-Sleep 5
+        Write-MyLogger "Restarting RBS service on $computer" Cyan
+        try {
+            Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                get-service "rubrik backup service" | Stop-Service 
+                Start-Sleep 2
+                get-service "rubrik backup service" | Start-Service
+            }
+        } catch {
+            Write-MyLogger "ERROR! Could not restart service properly on $Computer. Please check manually"
+            continue
+        }
     }
     #EndRegion ChangeRBSCredentials *and* RBSUserName=LocalSystem
 
@@ -867,7 +903,7 @@ foreach($Computer in $ValidComputerList){
 
     #Region Add Windows Host to RSC
     if ($RubrikClusterObject -and -not $ChangeRBSCredentialOnly) {
-        Write-MyLogger "Adding Host to RSC via API"
+        Write-MyLogger "Adding Host to RSC via API" CYAN
         $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.UUID
         if ($result.errors) {
             Write-MyLogger "ERROR! Could not add host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)"
