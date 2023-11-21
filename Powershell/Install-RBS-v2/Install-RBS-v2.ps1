@@ -106,6 +106,10 @@ if (-not $IsWindows) {
 #EndRegion
 
 
+#Suppress progress bars from commands. Will set back to oldProgressPreference at end of script
+$oldProgressPreference = $progressPreference; 
+$progressPreference = 'SilentlyContinue'
+
 
 #################################################################################################
 #Region Define some constants, regexes, etc
@@ -318,8 +322,8 @@ function New-Host(){
     )
     $hostsToAdd = [System.Collections.ArrayList]::new()
     foreach($item in $inputHost){
-        $this = @{"hostname"=$item}
-        $hostsToAdd.add($this) | Out-Null
+        $HostnameToAdd = @{"hostname"=$item}
+        $hostsToAdd.add($HostnameToAdd) | Out-Null
     }
     $payload = @{
         query = 'mutation AddPhysicalHostMutation(
@@ -631,8 +635,11 @@ if (-not $ChangeRBSCredentialOnly) {
 #Region Loop Through Computer List
 foreach($Computer in $($ComputerName -split ',')){
     Write-MyLogger $LineSepDashes
-    Write-MyLogger "Testing connectivity to $Computer. Please wait." CYAN
-    if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
+    Write-MyLogger "Testing connectivity to $Computer to WinRM port/service (TCP5985). Please wait." CYAN
+    #if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
+    #Using Test-NetConnection (Windows only) to verify WinRM port is open and service running, which is what Invoke-Command uses
+    #NOT using Ping incase it is disabled; no ping != unavailable
+    if ( Test-NetConnection -ComputerName $computer -CommonTCPPort winrm -InformationLevel quiet -ErrorAction SilentlyContinue -WarningAction SilentlyContinue) {
         Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
     } else {
         Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
@@ -677,6 +684,8 @@ foreach($Computer in $($ComputerName -split ',')){
         try {
             Invoke-Command -Session $Session -ScriptBlock {
                 Start-Process -FilePath "C:\Temp\RubrikBackupService\RubrikBackupService.msi" -ArgumentList "/quiet" -Wait
+                #added sleep to give a few extra seconds for service to install/start on it's own
+                sleep 3
             }        
         } catch {
             Write-MyLogger "ERROR! There was an error installing RBS to $Computer. Please try manually" RED
@@ -891,4 +900,6 @@ If ($log) {
     Write-MyLogger "Log file can be found at $logfile" GREEN
 }
 & $EndSummary_scriptBlock
+$progressPreference = $oldProgressPreference 
+
 #EndRegion Main Script
