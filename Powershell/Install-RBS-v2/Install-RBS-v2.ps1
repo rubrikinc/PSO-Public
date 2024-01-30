@@ -70,6 +70,9 @@ param(
     #Username to connect with. If RBSPassword not included on command line, will prompt for password (Secure!)
     [string]$RBSUserName,
 
+    #Option to skip add RBSUserName to local administrators group
+    [switch]$SkipAddToAdministratorsGroup,
+
     #Optionally, can use username and password (clear text!) via command line. NOT RECOMMENDED
     [string]$RBSPassword,
 
@@ -720,20 +723,24 @@ foreach($Computer in $($ComputerName -split ',')){
         Write-MyLogger "Running Rubrik Backup Service as LocalSystem" CYAN
     } else {
         #Region adding username to administrators on remote computer
-        Start-Sleep 5
-        Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                param ($user)
-                if ( $(Get-LocalGroupMember administrators).name -contains $user) {
-                    Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
-                } else {
-                    Add-LocalGroupMember -Group "Administrators" -Member $user
-                }
-            } -ArgumentList $RBSUserName
-        } catch {
-            Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
-            continue
+        if ($SkipAddToAdministratorsGroup) {
+            Write-MyLogger "Skipping adding user $RBSUserName to administrators group" Yellow
+        } else {
+            Start-Sleep 5
+            Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
+            try {
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    param ($user)
+                    if ( $(Get-LocalGroupMember administrators).name -contains $user) {
+                        Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
+                    } else {
+                        Add-LocalGroupMember -Group "Administrators" -Member $user
+                    }
+                } -ArgumentList $RBSUserName
+            } catch {
+                Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
+                continue
+            }
         }
         #EndRegion adding username to administrators on remote computer
 
