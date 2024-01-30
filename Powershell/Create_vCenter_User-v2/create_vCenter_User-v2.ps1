@@ -274,14 +274,22 @@ if ($vCenterCredFile -and ( Test-Path $vCenterCredFile) ) {
 } elseif ($vCenterAdminUser) {
     write-Host "  > User specified! Prompting for Password" -ForegroundColor Yellow
     # If username provided but not password, prompt for password
-    $credential = Get-Credential -UserName $vCenterAdminUser -Message "Please enter vCenter admin credentials" -Title "User account with Admin privs on vCenter to create Rubrik Role"
+    if ($PSVersionTable.PSVersion.Major -le 5) {
+        $credential = Get-Credential -UserName $vCenterAdminUser -Message "Please enter vCenter admin credentials"
+    } else {
+        $credential = Get-Credential -UserName $vCenterAdminUser -Message "Please enter vCenter admin credentials" -Title "User account with Admin privs on vCenter to create Rubrik Role"
+    }
     $vCenterParams = @{
         Server     = $vCenter
         Credential = $credential
     }
 } else {
     Write-Host "  > No credential file found, no user/pw specified on command line, please provide vCenter Admin credentials" -ForegroundColor Yellow
-    $credential = Get-Credential -Message "Please enter vCenter admin credentials" -Title "User account with Admin privs on vCenter to create Rubrik Role"
+    if ($PSVersionTable.PSVersion.Major -le 5) {
+        $credential = Get-Credential -Message "Please enter vCenter admin credentials" 
+    } else {
+        $credential = Get-Credential -Message "Please enter vCenter admin credentials" -Title "User account with Admin privs on vCenter to create Rubrik Role"
+    }
     $vCenterParams = @{
         Server     = $vCenter
         Credential = $credential
