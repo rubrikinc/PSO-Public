@@ -11,18 +11,22 @@
     - Grants service account "Log on as a service" on remote server
     - Sets service to run as specified user account and restarts service. 
          OPTIONAL: Can specify "LocalSystem" as user account for built in "LocalSystem" Account
+    NOTE: Must be run from Windows
     NOTE: REQUIRES PS6 or greater due to Remote PSSessions and SSL download
     OPTIONAL: Run with ChangeRBSCredentialOnly switch at CLI to change user/pw on existing RBS installs only (no install)
 
-    OPTIONAL: Can connect to RSC and automatically add host to specified cluster. Requires RSC service account JSON file
-    - Connect to RSC using specified RSC Service Account JSON File
-    - Queries list of connected clusters matching "RubrikCluster" string
+    OPTIONAL: Can connect to RSC and automatically add host to specified cluster. Requires RSC service account XML file
+    - Updated 2024.02.29 to use RubrikSecurityCloud PS module from PSGallery instead of custom built functions
+    - Connect to RSC using pre-created RSC Service Account XML File (create using Set-RSCServiceAccountFile)
+    - Queries RSC and returns list of connected clusters matching "RubrikCluster" string (can be a UUID of the cluster)
     - If no matches, exit
     - If multiple matches, prompt for which cluster
     - If using RSC method, RBS download will be from the IP of the first node in the cluster
 
+
 .NOTES
     Updated 2023.08.26 by David Oslager for community usage
+    - Updated 2024.02.29 to use RubrikSecurityCloud PS module from PSGallery instead of custom functions
     GitHub: doslagerRubrik
     Originally based on Install-RubrikBackupService.ps1 by Chris Lumnah
     https://github.com/rubrikinc/rubrik-scripts-for-powershell/blob/master/RBS/Install-RubrikBackupService.ps1
@@ -49,32 +53,37 @@
     Install RBS from Cluster "rubrik01.domain.com" using specified PSCredential Variable (must be defined, or will prompt for user/pw)
 
 .EXAMPLE
-    Install-RBS-v2.ps1 -RubrikCluster rubrik01 -RBSCredential $RBSCredential -RSCserviceAccountJSON .\path\to\SvcAcct.JSON
+    Install-RBS-v2.ps1 -RubrikCluster rubrik01 -RBSCredential $RBSCredential -RSCserviceAccountXML .\path\to\SvcAcct.XML
 
     Connect to RSC and verify cluster name in RSC and it's connected. Then download RBS from IP of first node in cluster "rubrik01"
     and install RBS with RunAs using specified PSCredential Variable (must be defined, or will prompt for user/pw)
 
 #>
 #Requires -version 6.0
+#Requires -modules RubrikSecurityCloud
 [CmdletBinding()]                                # <-- Verbose and Debug enabled with the [CmdletBinding()] directive
 param(
-    #Rubrik Cluster name (must match RSC name) or ip address (only if not adding to RSC) or Cluster UUID
+    #Rubrik Cluster name 
+    # used to search for a match to name in RSC
+    # or Cluster UUID (will look up cluster UUID in RSC)
+    # or ip address/FQDN if not adding to RSC - used for direct HTTPS connection to download RBS zip package
     [string]$RubrikCluster,
     
-    #Comma separated list of computer(s) that should have the Rubrik Backup Service installed onto and then added into Rubrik 
+    #Comma separated list of computer(s) that should have the Rubrik Backup Service installed
     [String]$ComputerName,
 
-    #Credential to run the Rubrik Backup Service on the Computer
+    #Credential to run the Rubrik Backup Service on the Windows Server - Can be username, gMSA, or "LocalSystem"
     [pscredential]$RBSCredential,
 
     #Username to connect with. If RBSPassword not included on command line, will prompt for password (Secure!)
     [string]$RBSUserName,
 
-    #Option to skip add RBSUserName to local administrators group
-    [switch]$SkipAddToAdministratorsGroup,
-
     #Optionally, can use username and password (clear text!) via command line. NOT RECOMMENDED
     [string]$RBSPassword,
+
+    #Option to skip add RBSUserName to local administrators group
+    #NOTE: Service Account user MUST be member of administrators group. ONLY Use this if user is already a member through nested groups
+    [switch]$SkipAddToAdministratorsGroup,
 
     #Skip RBS install, change RBS user/pw only
     [switch]$ChangeRBSCredentialOnly,
@@ -85,13 +94,10 @@ param(
     #Local Location to store download of RBS
     [string]$Path = "c:\temp",
 
-    #Quantity (int) of records to query (default = 50)
-    [int]    $QueryQuantity = 50,
+    # Path to Service account XML file
+    [string] $RSCserviceAccountXML,
 
-    # Path to Service account JSON file
-    [string] $RSCserviceAccountJSON,
-
-    # Shows details from RSC GraphQL searches-similar to Verbose, but without the builtin verbose statements
+    # Shows details from RSC GraphQL searches-similar to Verbose, but without the builtin verbose statements, used for debugging
     [switch] $ShowDetails,
 
     # Create Log file of output
@@ -225,98 +231,6 @@ Function Write-MyLogger {
 } #end Write-MyLogger
 
 
-function Connect-RSC {
-    [CmdletBinding()]
-    param (    
-        [Parameter(Mandatory)]
-        [String]
-        #Service account file from Rubrik Security Cloud with permissions to handle M365 operations
-        $serviceAccountFile
-    )
-
-    #The following lines are for brokering the connection to RSC
-    #Test the service account json for valid json content
-    try {
-        Get-Content $serviceAccountFile | ConvertFrom-Json | out-null
-    }
-    catch {
-        Write-MyLogger "Service Account Json is not valid, please redownload from Rubrik Security Cloud" RED
-        exit
-    }
-
-    #Convert the service account json to a PowerShell object
-    $serviceAccountJson = Get-Content $serviceAccountFile | convertfrom-json
-
-    #Create headers for the initial connection to RSC
-    $headers = @{
-        'Content-Type' = 'application/json';
-        'Accept'       = 'application/json';
-    }
-
-    #Create payload to send for authentication to RSC
-    $payload = @{
-        grant_type    = "client_credentials";
-        client_id     = $serviceAccountJson.client_id;
-        client_secret = $serviceAccountJson.client_secret
-    } 
-
-    #Try to send payload through to RSC to get bearer token
-    try {
-        $response = Invoke-RestMethod -Method POST -Uri $serviceAccountJson.access_token_uri -Body $($payload | ConvertTo-JSON -Depth 100) -Headers $headers    
-    }
-    catch {
-        Write-MyLogger "Failed to authenticate, check the contents of the service account json, and ensure proper permissions are granted" RED
-        exit
-    }
-
-    #Create connection object for all subsequent calls with bearer token
-    $connection = [PSCustomObject]@{
-        headers  = @{
-            'Content-Type'  = 'application/json';
-            'Accept'        = 'application/json';
-            'Authorization' = $('Bearer ' + $response.access_token);
-        }
-        endpoint = $serviceAccountJson.access_token_uri.Replace('/api/client_token', '/api/graphql')
-    }
-    #End brokering to RSC
-    Write-MyLogger "Authentication to RSC succeeded" GREEN
-    $global:connection = $connection
-    return $connection
-} #end Connect-RSC
-
-
-function Get-RSCRubrikData {
-    param (
-        #Payload to pass to GraphQL Query
-        [hashtable]$Payload,
-        [string]   $QueryType = "nodes",
-        [string]   $QueryDescription = "data",
-        [switch]   $silent
-    )
-    if (-not $silent) {
-        Write-MyLogger "Querying RSC for $QueryDescription....please wait"
-    }
-    $data = [System.Collections.ArrayList]::new()
-    $response = Invoke-RestMethod  @ConnectToRSCParams -Body $($payload | ConvertTo-JSON -Depth 100) 
-    $QueryName = $response.data.psobject.properties.name
-    if ($ShowDetails) {write-mylogger "QueryName = $QueryName" MAGENTA}
-    foreach ($item in $response.data.$QueryName.$QueryType) {
-        $data.add($item) | out-null
-    }
-    while ($response.data.$QueryName.pageInfo.hasNextPage) {
-        #if (-not $silent) {
-            Write-MyLogger " > Grabbed a page of data, grabbing another"
-        #}
-        $payload.variables.after = $response.data.$QueryName.pageinfo.endCursor
-        $response = Invoke-RestMethod  @ConnectToRSCParams -Body $($payload | ConvertTo-JSON -Depth 100) 
-        foreach ($item in $response.data.$QueryName.$QueryType) {
-            $data.add($item) | out-null
-        }
-    }
-    return $data
-
-} #end Get-RSCRubrikData
-
 
 function New-Host(){
     param(
@@ -328,27 +242,28 @@ function New-Host(){
         $HostnameToAdd = @{"hostname"=$item}
         $hostsToAdd.add($HostnameToAdd) | Out-Null
     }
-    $payload = @{
-        query = 'mutation AddPhysicalHostMutation(
-            $clusterUuid: String!
-            $hosts: [HostRegisterInput!]!
-          ) {
+    $QueryString = '
+    mutation AddPhysicalHostMutation(
+        $clusterUuid: String!
+        $hosts: [HostRegisterInput!]!
+        ) {
             bulkRegisterHost(input: {clusterUuid: $clusterUuid, hosts: $hosts}) {
-              data {
-                hostSummary {
-                  id
+                data {
+                    hostSummary {
+                        id
+                    }
                 }
-              }
             }
-          }'
-        variables = @{
-            clusterUuid = $clusteruuid
-            hosts       = $hostsToAdd
-        }
+        }'
+    $variables = @{
+        clusterUuid = $clusteruuid
+        hosts       = $hostsToAdd
     }
-    $response = Invoke-RestMethod @ConnectToRSCParams -Body $($payload | ConvertTo-JSON -Depth 100)
+    $response = Invoke-Rsc -GqlQuery $QueryString -Var $variables
     return $response
 } #End Function New-Host
+
+
 
 
 #EndRegion Functions
@@ -362,32 +277,45 @@ function New-Host(){
 & $HeaderBlock_scriptBlock
 
 
-#prompt for RSCServiceAccountJSON
-If ($RSCserviceAccountJSON) {
-    Write-MyLogger "RSCserviceAccountJSON specified opn command line: $RSCserviceAccountJSON" GREEN
+#prompt for RSCserviceAccountXML
+If ($RSCserviceAccountXML) {
+    Write-MyLogger "RSCserviceAccountXML specified on command line: $RSCserviceAccountXML" GREEN
+} elseif ( $RubrikCluster ) {
+    Write-MyLogger "RubrikCluster IP/DNS specified on command line: $RubrikCluster" GREEN
 } else {
-    Write-MyLogger "No RSCserviceAccountJSON Specified on Command Line." Yellow -NoTimeStamp
-    Write-MyLogger "  Enter path to RSC JSON file to automatically add the windows host to RSC," Yellow -NoTimeStamp
+    Write-MyLogger "No RSCserviceAccountXML Specified on Command Line." Yellow -NoTimeStamp
+    Write-MyLogger "  Enter path to RSC XML file to automatically add the windows host to RSC," Yellow -NoTimeStamp
     Write-MyLogger "  or leave blank to continue to skip RSC and automatic registration" Yellow -NoTimeStamp
-    $RSCserviceAccountJSON = Read-Host -Prompt "Please enter path to RSC Svc Acct JSON file"
+    $RSCserviceAccountXML = Read-Host -Prompt "Please enter path to RSC Svc Acct XML file"
     write-host
 }
 
 #Region RubrikCluster
 if ($ChangeRBSCredentialOnly) {
     Write-MyLogger "Change RBS Credential Only specified on command line. Skipping RBS download" GREEN
-} elseif ($null -ne $RSCserviceAccountJSON -and $RSCserviceAccountJSON -ne "") {
+} elseif ($null -ne $RSCserviceAccountXML -and $RSCserviceAccountXML -ne "") {
     #connect to RSC
     #################################################################################################
-    #Region Connect to RSC, create Splat of common params
-    $connection = Connect-RSC -serviceAccountFile $RSCserviceAccountJSON
-    $ConnectToRSCParams = @{
-        Method  = 'POST'
-        Uri     = $connection.endpoint 
-        Headers = $connection.headers
+    #Region Connect to RSC
+    #First confirm we can read the XML file
+    try {
+        $XMLContent = Get-Content $RSCserviceAccountXML
     }
-    #EndRegion Connect to RSC
+    catch {
+        Write-MyLogger "Service Account XML is not valid, please verify and retru" RED
+        exit
+    }
+
+    #Try to connect to RSC
+    try {
+        $connection = Connect-RSC -ServiceAccountFile $RSCserviceAccountXML
+    } catch {
+        Write-MyLogger "Failed to authenticate, check the contents of the service account XML, and ensure proper permissions are granted" RED
+        exit
+    }
     Write-MyLogger $LineSepHashesFull Cyan -NoTimeStamp
+    #EndRegion Connect to RSC
+
 
     #################################################################################################
     #Region Get list of Rubrik clusters from RSC
@@ -401,18 +329,15 @@ if ($ChangeRBSCredentialOnly) {
             status
             defaultAddress
             clusterNodeConnection {
-            nodes {
-                ipAddress
-            }
+                nodes {
+                    ipAddress
+                }
             }
         }
         }
     }
     '
-
-    #$QueryQuantity = 50
     $variables = @{
-        first     = $QueryQuantity
         last      = $null
         sortOrder = "ASC"
         sortBy    = "ClusterName"
@@ -422,6 +347,7 @@ if ($ChangeRBSCredentialOnly) {
             excludeId       = "00000000-0000-0000-0000-000000000000"
         }
     }
+    #Endregion QueryString and Vars
 
     if ($RubrikCluster -match $ValidGUIDRegex) {
         Write-MyLogger "Rubrik Cluster name matches GUID. Searching by ID instead of name" Yellow
@@ -429,13 +355,16 @@ if ($ChangeRBSCredentialOnly) {
         $variables.filter.add("id",$RubrikCluster)
     }
 
-    #Endregion QueryString and Vars
-    $Payload = @{
-        query     = $QueryString
-        variables = $variables
+    try {
+        Write-MyLogger "Querying RSC for list of clusters"
+        $RSCRubrikClusters_temp = (Invoke-RSC -GqlQuery $QueryString -Var $variables).nodes
+    } catch {
+        Write-MyLogger "There was an error querying RSC. Exiting. Please try again" RED
+        exit
     }
-    $RSCRubrikClusters_temp = Get-RSCRubrikData -Payload $Payload -QueryDescription "list of Rubrik Clusters"
-    Write-MyLogger "Verifying cluster is in RSC: "
+
+    #Create object of cluster info from above query
+    Write-MyLogger "Verifying cluster is in RSC"
     $RSCRubrikClusters = @()
     foreach ($RSCRubrikCluster_temp in $RSCRubrikClusters_temp) {
         $RSCRubrikCluster = New-Object -Type PSObject
@@ -452,6 +381,7 @@ if ($ChangeRBSCredentialOnly) {
         $RSCRubrikClusters += $RSCRubrikCluster
     }
 
+    #ouput table - kinda like verbose w/o being verbose
     if ($ShowDetails) {
         Write-MyLogger $LineSepDashesFull
         foreach ($RSCRubrikCluster in $RSCRubrikClusters) {
@@ -466,6 +396,7 @@ if ($ChangeRBSCredentialOnly) {
         }
     }
 
+    #Find the right cluster based on input
     if ($RscRubrikClusters.count -eq 0) {
         Write-myLogger "Error! No cluster found matching the name/ID ""$RubrikCluster"". Please verify and try again" RED
         exit
@@ -484,33 +415,35 @@ if ($ChangeRBSCredentialOnly) {
             Write-MyLogger "Multiple Clusters found. Please choose which cluster" YELLOW
         }
         Write-MyLogger -NoTimeStamp
+        #create pretty table with cluster names and info for use to pick from interactively
         #Calculate width of each column based on max length, and then calculate total length as sum of all columns
         $len_digits         = (@($RSCRubrikClusters.count.tostring().length,3) | Measure-object -maximum).Maximum
         $len_name           = ($RSCRubrikClusters.name           | measure-object -maximum -property length).maximum
         $len_DefaultAddress = ($RSCRubrikClusters.DefaultAddress | measure-object -maximum -property length).maximum
-        $len_Status         = ($RSCRubrikClusters.Status         | measure-object -maximum -property length).maximum
+        #$len_Status         = ($RSCRubrikClusters.Status         | measure-object -maximum -property length).maximum
+        $len_Status         = 12 #Had to change this because using Invoke-RSC returns as a value, not as a string
         $len_UUID           = ($RSCRubrikClusters.UUID           | measure-object -maximum -property length).maximum
         $len_IPAddress0     = ($RSCRubrikClusters.IPAddress0     | measure-object -maximum -property length).maximum
         $len_total          = ($len_digits + $len_name + $len_DefaultAddress + $len_Status + $len_UUID + $len_IPAddress0 + 16)
 
         #Output column headers and line separators
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
-        Write-MyLogger ("{0,$($len_digits)}   {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f "Num", "Name", "DefaultAddress", "Status", "UUID", "IPAddress[0]") -NoTimeStamp
+        Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f "Num", "Name", "DefaultAddress", "Status", "UUID", "IPAddress[0]") -NoTimeStamp
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
 
         $i=1
         foreach ($RSCRubrikCluster in $RSCRubrikClusters) {
             # Output Table with number in first column for user to pick from
-            Write-MyLogger ("{0,$($len_digits+1)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f $i, $RSCRubrikCluster.Name, $RSCRubrikCluster.DefaultAddress, $RSCRubrikCluster.Status, $RSCRubrikCluster.UUID, $RSCRubrikCluster.IPAddress0) -NoTimeStamp
+            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f $i, $RSCRubrikCluster.Name, $RSCRubrikCluster.DefaultAddress, $RSCRubrikCluster.Status, $RSCRubrikCluster.UUID, $RSCRubrikCluster.IPAddress0) -NoTimeStamp
             $i++
         }
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
 
         do {
             try {
-                $SelectedIndex=(Read-Host -Prompt "Select a Cluster" -erroraction stop).ToInt32($null) 
+                $SelectedIndex=(Read-Host -Prompt "Select Cluster Number" -erroraction stop).ToInt32($null) 
             } catch {
-                Write-MyLogger "Not a proper response. Please try again" RED -NoTimeStamp 
+                Write-MyLogger "Not a proper response. Pick a number from the NUM column. Please try again" RED -NoTimeStamp 
             }
         } while ($SelectedIndex -notin (1..$($RSCRubrikClusters.count)))
 
@@ -527,12 +460,12 @@ if ($ChangeRBSCredentialOnly) {
     #EndRegion Get a list of clusters from RSC
     $RubrikCluster = $RubrikClusterObject.Name
 } else {
-    #No RSCServiceAccountJSON
+    #No RSCserviceAccountXML
     If ($RubrikCluster) {
         Write-MyLogger "Rubrik Cluster specified: $RubrikCluster" GREEN
     } else {
         Write-MyLogger "ERROR! Rubrik cluster not specified on command line for RBS Download" RED -NoTimeStamp
-        $RubrikCluster = Read-Host -Prompt "Please enter Rubrik Cluster Name or IP to download RBS from"
+        $RubrikCluster = Read-Host -Prompt "Please enter Rubrik Cluster DNS Name or IP to download RBS from"
         write-host
     }
 }
@@ -877,7 +810,8 @@ foreach($Computer in $($ComputerName -split ',')){
             Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
         } else {
             Write-MyLogger "Success! Added host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)" GREEN
-            Write-MyLogger "  > $Computer RSC Object ID: $($result.data.bulkRegisterHost.data[0].hostSummary.id)" GREEN
+            Write-MyLogger "  > RSC Object ID: " GREEN -NoNewLine
+            Write-MyLogger "$($result.data[0].hostSummary.id)" white -NoTimeStamp
         }
     }
     #endRegion Add Windows Host to RSC
@@ -899,12 +833,18 @@ if (-not $ChangeRBSCredentialOnly) {
 }
 
 
+
 Write-MyLogger $LineSepHashesFull Cyan -NoTimeStamp
 #################################################################################################
 #Script Complete
 Write-MyLogger "Script Complete!" GREEN
 If ($log) {
     Write-MyLogger "Log file can be found at $logfile" GREEN
+}
+#Disconnect from RSC, if connected
+if ($RSCserviceAccountXML) {
+    Write-MyLogger "Disconnecting from RSC" GREEN
+    Disconnect-Rsc | out-null
 }
 & $EndSummary_scriptBlock
 $progressPreference = $oldProgressPreference 

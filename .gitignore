@@ -11,3 +11,6 @@
 /*/Logs
 *stuff*
 /Powershell/*/zzTesting
+Powershell/.DS_Store
+Powershell/Install-RBS-v2/.vscode/launch.json
+Powershell/Install-RBS-v2/.vscode/tasks.json
