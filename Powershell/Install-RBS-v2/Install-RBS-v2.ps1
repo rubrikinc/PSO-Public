@@ -97,6 +97,9 @@ param(
     # Path to Service account XML file
     [string] $RSCserviceAccountXML,
 
+    # Name or ID of SLA to apply to SQL Object after RBS is installed
+    [string] $ApplySLAtoSqlObject,
+
     # Shows details from RSC GraphQL searches-similar to Verbose, but without the builtin verbose statements, used for debugging
     [switch] $ShowDetails,
 
@@ -116,8 +119,8 @@ if (-not $IsWindows) {
 
 
 #Suppress progress bars from commands. Will set back to oldProgressPreference at end of script
-$oldProgressPreference = $progressPreference; 
-$progressPreference = 'SilentlyContinue'
+$oldProgressPreference = $Global:progressPreference
+$Global:progressPreference = 'SilentlyContinue'
 
 
 #################################################################################################
@@ -231,7 +234,8 @@ Function Write-MyLogger {
 } #end Write-MyLogger
 
 
-
+#Region Function New-Host
+#adds Windows Host to RSC
 function New-Host(){
     param(
         [string[]]$inputHost,
@@ -261,8 +265,120 @@ function New-Host(){
     }
     $response = Invoke-Rsc -GqlQuery $QueryString -Var $variables
     return $response
-} #End Function New-Host
+} 
+#endRegion Function New-Host
 
+
+#Region Function Select-RscSlaDomainTable
+Function Select-RscSlaDomainTable {
+    Param ( 
+        [string] $SlaDomain
+    )
+
+    #Create Table of RscSlaDomains and have end user pick correct one
+    if ($SlaDomain -match $ValidGUIDRegex) {
+        #looking for SLA with UUID
+        Write-MyLogger "SLA matches UUID" Yellow
+        try {
+            $RscSlaDomains = Get-RscSla
+        } catch {
+            Write-MyLogger "ERROR! There was a problem getting a list of SLA Domains" RED
+        }
+        $RscSlaDomain = $RscSlaDomains | Where-Object {$_.id -eq $SlaDomain}
+        if ($null -eq $RscSlaDomain) {
+            Write-MyLogger "ERROR! SLA with UUID $SlaDomain was not found. Please try again" RED
+            exit
+        }
+
+    } else {
+        #pull list of SLAs matching name and if more than one, prompt to select
+        $RscSlaDomains = Get-RscSla -name $SlaDomain
+        if ($RscSlaDomains.count -eq 0) {
+            #if result = 0 throw error and quit
+            Write-MyLogger "ERROR! No SLA Domains were found. Please verify and try again" RED
+            exit
+        } elseif ($RscSlaDomains.count -eq 1) {
+            #if result = 1 get ID from object
+            $RscSlaDomain = $RscSlaDomains
+        } else {
+            #if result > 1, build pretty table and ask user to select from list
+            $RscSlaDomainsNew = @()
+            foreach ($RscSlaDomain_temp in $RscSlaDomains) {
+                $RscSlaDomainNew_temp = New-Object -type psobject
+                $RscSlaDomainNew_temp | Add-Member -Type NoteProperty -name "Name"        -Value $RscSlaDomain_temp.Name
+                $RscSlaDomainNew_temp | Add-Member -Type NoteProperty -name "id"          -Value $RscSlaDomain_temp.id
+                $BaseFreqDuration     = $RscSlaDomain_temp.BaseFrequency.DurationField
+                $BaseFreqUnit         = $RscSlaDomain_temp.BaseFrequency.Unit.ToString()[0].ToString().ToLower()
+                $RscSlaDomainNew_temp | Add-Member -Type NoteProperty -name "BaseFreq"    -Value "$BaseFreqDuration$BaseFreqUnit"
+                $RscSlaDomainsNew += $RscSlaDomainNew_temp
+            }
+
+            Write-MyLogger "Multiple SLA Domains found matching $SlaDomain. Please choose which SLA to use" Yellow
+            $len_digits         = (@($RscSlaDomainsNew.count.tostring().length,3) | Measure-object -maximum).Maximum
+            $len_name           = ($RscSlaDomainsNew.name           | measure-object -maximum -property length).maximum
+            $len_id             = ($RscSlaDomainsNew.Id             | measure-object -maximum -property length).maximum
+            $len_BaseFreq       = ($RscSlaDomainsNew.BaseFreq       | measure-object -maximum -property length).maximum
+            $len_total          = ($len_digits + $len_name + $len_id + $len_BaseFreq + 15)
+    
+            #Output column headers and line separators
+            Write-MyLogger $("-" * $len_total) -NoTimeStamp
+            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_id}   {3,-$len_BaseFreq}" -f "Num", "Name", "ID", "BaseFreq") -NoTimeStamp
+            Write-MyLogger $("-" * $len_total) -NoTimeStamp
+    
+            $i=1
+            foreach ($RscSlaDomainNew in $RscSlaDomainsNew) {
+                # Output Table with number in first column for user to pick from
+                Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_id}   {3,-$len_BaseFreq}" -f $i, $RscSlaDomainNew.Name, $RscSlaDomainNew.id, $RscSlaDomainNew.BaseFreq) -NoTimeStamp
+                $i++
+            }
+            Write-MyLogger $("-" * $len_total) -NoTimeStamp
+        
+            do {
+                try {
+                    $SelectedIndex=(Read-Host -Prompt "Select SLA Domain Number" -erroraction stop).ToInt32($null) 
+                } catch {
+                    Write-MyLogger "Not a proper response. Pick a number from the NUM column. Please try again" RED -NoTimeStamp 
+                }
+            } while ($SelectedIndex -notin (1..$($RscSlaDomainsNew.count)))
+    
+            $RscSlaDomain = $RscSlaDomainsNew[$SelectedIndex-1]
+            #Write-MyLogger "You selected $($RscSlaDomain.Name) ($($RscSlaDomain.Id))"
+            #Write-MyLogger -NoTimeStamp
+        }
+    }
+    return $RscSlaDomain
+}
+#EndRegion Function Select-RscSlaDomainTable
+
+
+
+
+#Region Get List of MSSQL Instance
+Function Get-MyRscMssqlInstances {
+    #region QueryString and Vars
+    $QueryString = '
+    query MssqlHostHierarchyHostListQuery($filter: [Filter!]) {
+        mssqlTopLevelDescendants(filter: $filter) {
+            nodes {
+            id
+            name
+            }
+        }
+    }
+    '
+    $variables = @{
+        filter    = @( 
+            @{
+            field    = "CLUSTER_ID"
+            texts    = @($($RubrikClusterObject.id))
+            }
+        )
+    }
+    #Endregion QueryString and Vars
+    $RscMssqlServers = (Invoke-Rsc -GqlQuery $QueryString -Var $variables).Nodes
+    return $RscMssqlServers | Select Name, ID
+}
+#EndRegion Get List of MSSQL Instance
 
 
 
@@ -302,7 +418,7 @@ if ($ChangeRBSCredentialOnly) {
         $XMLContent = Get-Content $RSCserviceAccountXML
     }
     catch {
-        Write-MyLogger "Service Account XML is not valid, please verify and retru" RED
+        Write-MyLogger "Service Account XML is not valid, please verify and retry" RED
         exit
     }
 
@@ -371,7 +487,7 @@ if ($ChangeRBSCredentialOnly) {
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "Name"           -Value $RSCRubrikCluster_temp.Name
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "DefaultAddress" -Value $RSCRubrikCluster_temp.DefaultAddress
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "Status"         -Value $RSCRubrikCluster_temp.Status
-        $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "UUID"           -Value $RSCRubrikCluster_temp.id
+        $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "ID"             -Value $RSCRubrikCluster_temp.id
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "IPAddress"      -Value $RSCRubrikCluster_temp.clusterNodeConnection.Nodes.ipAddress
         if ($RSCRubrikCluster_temp.clusterNodeConnection.Nodes.ipAddress -is [array] ) {
             $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "IPAddress0" -Value $RSCRubrikCluster_temp.clusterNodeConnection.Nodes.ipAddress[0]
@@ -389,7 +505,7 @@ if ($ChangeRBSCredentialOnly) {
             Write-MyLogger "RSCCluster[$i].Name             = $($RSCRubrikCluster.Name)" CYAN
             Write-MyLogger "RSCCluster[$i].DefaultAddress   = $($RSCRubrikCluster.DefaultAddress)" CYAN
             Write-MyLogger "RSCCluster[$i].Status           = $($RSCRubrikCluster.Status)" CYAN
-            Write-MyLogger "RSCCluster[$i].UUID             = $($RSCRubrikCluster.UUID)" CYAN
+            Write-MyLogger "RSCCluster[$i].ID               = $($RSCRubrikCluster.ID)" CYAN
             Write-MyLogger "RSCCluster[$i].IPAddress        = $($RSCRubrikCluster.IPAddress)" CYAN
             Write-MyLogger "RSCCluster[$i].IPAddress0       = $($RSCRubrikCluster.IPAddress0)" CYAN
             Write-MyLogger $LineSepDashesFull
@@ -418,23 +534,22 @@ if ($ChangeRBSCredentialOnly) {
         #create pretty table with cluster names and info for use to pick from interactively
         #Calculate width of each column based on max length, and then calculate total length as sum of all columns
         $len_digits         = (@($RSCRubrikClusters.count.tostring().length,3) | Measure-object -maximum).Maximum
-        $len_name           = ($RSCRubrikClusters.name           | measure-object -maximum -property length).maximum
-        $len_DefaultAddress = ($RSCRubrikClusters.DefaultAddress | measure-object -maximum -property length).maximum
-        #$len_Status         = ($RSCRubrikClusters.Status         | measure-object -maximum -property length).maximum
-        $len_Status         = 12 #Had to change this because using Invoke-RSC returns as a value, not as a string
-        $len_UUID           = ($RSCRubrikClusters.UUID           | measure-object -maximum -property length).maximum
-        $len_IPAddress0     = ($RSCRubrikClusters.IPAddress0     | measure-object -maximum -property length).maximum
-        $len_total          = ($len_digits + $len_name + $len_DefaultAddress + $len_Status + $len_UUID + $len_IPAddress0 + 16)
+        $len_name           = ($RSCRubrikClusters.name              | measure-object -maximum -property length).maximum
+        $len_DefaultAddress = ($RSCRubrikClusters.DefaultAddress    | measure-object -maximum -property length).maximum
+        $len_Status         = ($RSCRubrikClusters.Status.ToString() | measure-object -maximum -property length).maximum
+        $len_ID             = ($RSCRubrikClusters.ID                | measure-object -maximum -property length).maximum
+        $len_IPAddress0     = ($RSCRubrikClusters.IPAddress0        | measure-object -maximum -property length).maximum
+        $len_total          = ($len_digits + $len_name + $len_DefaultAddress + $len_Status + $len_ID + $len_IPAddress0 + 16)
 
         #Output column headers and line separators
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
-        Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f "Num", "Name", "DefaultAddress", "Status", "UUID", "IPAddress[0]") -NoTimeStamp
+        Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_ID}   {5,-$len_IPAddress0}" -f "Num", "Name", "DefaultAddress", "Status", "ID", "IPAddress[0]") -NoTimeStamp
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
 
         $i=1
         foreach ($RSCRubrikCluster in $RSCRubrikClusters) {
             # Output Table with number in first column for user to pick from
-            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f $i, $RSCRubrikCluster.Name, $RSCRubrikCluster.DefaultAddress, $RSCRubrikCluster.Status, $RSCRubrikCluster.UUID, $RSCRubrikCluster.IPAddress0) -NoTimeStamp
+            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_ID}   {5,-$len_IPAddress0}" -f $i, $RSCRubrikCluster.Name, $RSCRubrikCluster.DefaultAddress, $RSCRubrikCluster.Status, $RSCRubrikCluster.ID, $RSCRubrikCluster.IPAddress0) -NoTimeStamp
             $i++
         }
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
@@ -470,6 +585,22 @@ if ($ChangeRBSCredentialOnly) {
     }
 }
 #EndRegion RubrikCluster
+
+
+
+#Region Get SLA ID for SQL server object
+if ($ApplySLAtoSqlObject) {
+    if (-not $connection) {
+        Write-MyLogger "ERROR! Not connected to RSC. Please start over and supply RSC service account" RED
+        exit
+    } else {
+        Write-MyLogger "Looking up SLA Domain ($ApplySLAtoSqlObject) for SQL Object" Yellow
+        $RscSlaDomainSQL = Select-RscSlaDomainTable -SlaDomain $ApplySLAtoSqlObject
+    }
+    Write-MyLogger "Using SLA Domain Name ""$($RscSlaDomainSQL.Name)"" ($($RscSlaDomainSQL.id))" GREEN
+}
+#EndRegion Get SLA ID for SQL server object
+
 
 
 #Region ComputerName(s)
@@ -548,17 +679,12 @@ if (-not $ChangeRBSCredentialOnly) {
     Write-MyLogger "Downloading RBS zip file from $url" CYAN
     Write-MyLogger "Saving as $OutFile" CYAN
 
-    #Set progress to none - Invoke-Webrequest is annoying and lingers over the CLI after it is complete
-    $oldProgressPreference = $progressPreference; 
-    $progressPreference = 'SilentlyContinue'
     try {
         $null = Invoke-WebRequest -Uri $url -OutFile $OutFile -SkipCertificateCheck
     } catch {
         Write-MyLogger "ERROR! Could not download RBS zip file from $RubrikCluster. Please verify connectivity" Red
         exit 1
     }
-    #Set ProgressPref back to what it was before we did IWR
-    $progressPreference = $oldProgressPreference 
     Write-MyLogger "Expanding RBS locally to c:\Temp\RubrikBackupService\" CYAN
     Expand-Archive -LiteralPath $OutFile -DestinationPath "$path\RubrikBackupService" -Force
 }
@@ -771,7 +897,7 @@ foreach($Computer in $($ComputerName -split ',')){
 
 
 
-    #Region RBSUserName=LocalSystem
+    #Region Set RBS to run as service account
     if ( $RBSUserName -eq "LocalSystem" -and -not $ChangeRBSCredentialOnly ) {
         Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
     } else {
@@ -797,14 +923,14 @@ foreach($Computer in $($ComputerName -split ',')){
             continue
         }
     }
-    #EndRegion ChangeRBSCredentials *and* RBSUserName=LocalSystem
+    #EndRegion Set RBS to run as service account
 
 
 
     #Region Add Windows Host to RSC
     if ($RubrikClusterObject -and -not $ChangeRBSCredentialOnly) {
         Write-MyLogger "Adding Host to RSC via API" CYAN
-        $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.UUID
+        $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.ID
         if ($result.errors) {
             Write-MyLogger "ERROR! Could not add host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)"
             Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
@@ -817,6 +943,81 @@ foreach($Computer in $($ComputerName -split ',')){
     #endRegion Add Windows Host to RSC
 
 
+
+    #Region Apply SLA to new SQL objects
+    if ($ApplySLAtoSqlObject) {
+        Write-MyLogger "Getting List of registered MSSQL instances registered to $($RubrikClusterObject.Name) / $($RubrikClusterObject.id)" CYAN
+        $i          = 0 
+        $sleeptime  = 10
+        $SleepMax   = 300
+        $sleepTotal = 0
+        do {
+            $i++
+            $sleepTotal += $SleepTime
+            $RscMssqlServers = Get-MyRscMssqlInstances
+            Write-MyLogger "  > Checking if $computer is registered as a MSSQL server in RSC (attempt $i)" Yellow
+            #$CompareResult = Compare-Object -ReferenceObject $RscMssqlServers.Name -DifferenceObject $ComputerName  | Where-Object {$_.sideindicator -eq "=>"}
+            if ( ($RscMssqlServers.Name -notcontains $Computer) -and ($sleepTotal -lt $SleepMax) ) {
+                Write-MyLogger "  > MSSQL server object for $computer not registered yet. Sleeping $sleeptime sec and trying again"
+                Start-Sleep $SleepTime
+            }
+        } until ( ($RscMssqlServers.Name) -contains $Computer -or ($sleepTotal -gt $SleepMax) )
+        if ($sleepTotal -gt $SleepMax) {
+            Write-MyLogger "ERROR! $Computer never appeared in RSC after $SleepTotal seconds. Skipping SLA Assignment" RED
+        } else {
+            #Must've appeared, lets apply the SLA to the new object
+            $RscMssqlServer = $RscMssqlServers | Where-Object {$_.name -eq $Computer}
+            Write-MyLogger "  > MSSQL server object $($RscMssqlServer.Name) found! Registered with $($RubrikClusterObject.Name)" GREEN
+            Write-MyLogger "  > Applying SLA ""$($RscSlaDomainSQL.Name)"" to object" CYAN
+            #Region Mutation and vars
+            $QueryString = '
+            mutation AssignMssqlSLAMutation($input: AssignMssqlSlaDomainPropertiesAsyncInput!) {
+                assignMssqlSlaDomainPropertiesAsync(input: $input) {
+                  items {
+                    objectId
+                    __typename
+                  }
+                  __typename
+                }
+              }
+            '
+
+            $variables = @{
+                input = @{
+                    updateInfo = @{
+                        ids = @(
+                            $RscMssqlServer.ID
+                        )
+                        shouldApplyToExistingSnapshots  = $false
+                        shouldApplyToNonPolicySnapshots = $false
+                        mssqlSlaPatchProperties         = @{
+                            useConfiguredDefaultLogRetention = $false
+                            configuredSlaDomainId            = $RscSlaDomainSQL.id
+                            mssqlSlaRelatedProperties        = @{
+                                copyOnly            = $false
+                                hasLogConfigFromSla = $false
+                                hostLogRetention    = -1
+                            }
+                        }
+                    }
+                }
+            }         
+            #EndRegion Mutation and vars
+            
+            #Apply mutation and variables via Invoke-RSC
+            try {
+                $result = Invoke-Rsc -GqlQuery $QueryString -var $variables
+            } catch {
+                Write-MyLogger "ERROR! there was an error applying the SLA to the object. Please verify manually in RSC"
+                Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
+            }
+        }
+    }
+    #EndRegion Apply SLA to new SQL objects
+
+
+
+
     if ($ChangeRBSCredentialOnly) {
         Write-MyLogger "Changing RBS Credentials on " -NoNewline CYAN
     } else {
@@ -825,6 +1026,8 @@ foreach($Computer in $($ComputerName -split ',')){
     Write-MyLogger "$computer complete" GREEN -NoTimeStamp
 } 
 #EndRegion Loop Through Computer List
+
+
 
 #Cleanup RBS downloads from $path folder (ie C:\Temp)
 if (-not $ChangeRBSCredentialOnly) {
@@ -847,6 +1050,6 @@ if ($RSCserviceAccountXML) {
     Disconnect-Rsc | out-null
 }
 & $EndSummary_scriptBlock
-$progressPreference = $oldProgressPreference 
+$Global:progressPreference = $oldProgressPreference 
 
 #EndRegion Main Script
