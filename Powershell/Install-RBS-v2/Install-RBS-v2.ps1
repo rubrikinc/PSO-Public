@@ -23,6 +23,9 @@
     - If multiple matches, prompt for which cluster
     - If using RSC method, RBS download will be from the IP of the first node in the cluster
 
+    ADDED 2024.03.11 - Can apply SLA to SQL Object that is automaticaly added to RSC when RBS discovers SQL
+    - use "ApplySLAtoSqlObject" command line argument to pass the name or UUID of the SLA to apply to SQL
+
 
 .NOTES
     Updated 2023.08.26 by David Oslager for community usage
@@ -88,16 +91,17 @@ param(
     #Skip RBS install, change RBS user/pw only
     [switch]$ChangeRBSCredentialOnly,
 
-    #Create rule to Open Windows Firewall ports (12800/12801 TCP)
+    #Create rule to Open Windows Firewall ports (12800/12801 TCP). Creates explicit rule for source ANY to host
     [switch]$OpenWindowsFirewall,
 
     #Local Location to store download of RBS
     [string]$Path = "c:\temp",
 
-    # Path to Service account XML file
+    # Path to Service account XML file. Must be created using Set-RSCServiceAccountFile from RubrikSecurityCloud PS Module
     [string] $RSCserviceAccountXML,
 
     # Name or ID of SLA to apply to SQL Object after RBS is installed
+    # Can be partial match for name, will display list of matches to choose from
     [string] $ApplySLAtoSqlObject,
 
     # Shows details from RSC GraphQL searches-similar to Verbose, but without the builtin verbose statements, used for debugging
