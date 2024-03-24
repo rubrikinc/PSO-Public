@@ -91,6 +91,9 @@ param(
     #Skip RBS install, change RBS user/pw only
     [switch]$ChangeRBSCredentialOnly,
 
+    #Skip RBS install, skip RBS user/pw change, register with RSC only
+    [switch]$SkipRBSinstall,
+
     #Create rule to Open Windows Firewall ports (12800/12801 TCP). Creates explicit rule for source ANY to host
     [switch]$OpenWindowsFirewall,
 
@@ -512,8 +515,9 @@ if ($ChangeRBSCredentialOnly) {
             Write-MyLogger "RSCCluster[$i].ID               = $($RSCRubrikCluster.ID)" CYAN
             Write-MyLogger "RSCCluster[$i].IPAddress        = $($RSCRubrikCluster.IPAddress)" CYAN
             Write-MyLogger "RSCCluster[$i].IPAddress0       = $($RSCRubrikCluster.IPAddress0)" CYAN
-            Write-MyLogger $LineSepDashesFull
-        }
+        }            
+        Write-MyLogger $LineSepDashesFull
+
     }
 
     #Find the right cluster based on input
@@ -571,9 +575,9 @@ if ($ChangeRBSCredentialOnly) {
         Write-MyLogger -NoTimeStamp
 
     }
-    Write-MyLogger $LineSepDashes
+    Write-MyLogger $LineSepDashes -NoTimeStamp
     $RubrikClusterObject | Format-List *
-    Write-MyLogger $LineSepDashes
+    Write-MyLogger $LineSepDashes -NoTimeStamp
     #$RBSDownloadURL =  "https://$($RubrikClusterObjectIPAddress0)/connector/RubrikBackupService.zip"
     #Write-MyLogger "URL: $RBSDownloadURL"
     #EndRegion Get a list of clusters from RSC
@@ -623,7 +627,9 @@ if ($ComputerName) {
 
 
 #Region User/Pw/Creds
-if ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
+if ($SkipRBSinstall) {
+    Write-MyLogger "SkipRBSInstall specified on command line, no Credential required" YELLOW
+} elseif ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
     #Credential supplied via command line and var type is a PSCredential
     Write-MyLogger "Credential specified. (user: $($RBSCredential.UserName))" CYAN
 } elseif ( $RBSCredential ) {
@@ -653,7 +659,9 @@ if ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
 }
 
 #Pull the user and password back out of the credential
-if ($RBSUserName -ne "LocalSystem") {
+if ($SkipRBSinstall) {
+    #Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS install" YELLOW
+} elseif ($RBSUserName -ne "LocalSystem") {
     $RBSUsername = $($RBSCredential.UserName)
     $RBSPassword = $($RBSCredential.GetNetworkCredential().Password)
     Write-Verbose "RBS Username:  $RBSUsername"
@@ -667,7 +675,9 @@ Write-MyLogger $LineSepHashesFull CYAN -NoTimeStamp
 #forcing PS6+ with the Requires at the top of the script. 
 #Do not want to use PS 5.x and dealing with SSL self signed certs
 #additional steps to invoke-command better run on PS7
-if (-not $ChangeRBSCredentialOnly) {
+if ($SkipRBSinstall) {
+    Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS download" YELLOW
+} elseif (-not $ChangeRBSCredentialOnly) {
     if (-not (test-path  $Path) ) {
         $null = New-Item -Path $Path -ItemType Directory 
     }
@@ -700,257 +710,263 @@ if (-not $ChangeRBSCredentialOnly) {
 ##############################################################################################################
 #Region Loop Through Computer List
 foreach($Computer in $($ComputerName -split ',')){
+    #Region Install RBS
     Write-MyLogger $LineSepDashes
-    Write-MyLogger "Testing connectivity to $Computer to WinRM port/service (TCP5985). Please wait." CYAN
-    #if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
-    #Using Test-NetConnection (Windows only) to verify WinRM port is open and service running, which is what Invoke-Command uses
-    #NOT using Ping incase it is disabled; no ping != unavailable
-    if ( Test-NetConnection -ComputerName $computer -CommonTCPPort winrm -InformationLevel quiet -ErrorAction SilentlyContinue -WarningAction SilentlyContinue) {
-        Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
+    if ($SkipRBSinstall) {
+        Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS install" YELLOW
     } else {
-        Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
-        continue
-    }  
-
-    if ($ChangeRBSCredentialOnly){
-        Write-MyLogger "Changing RBS Password on " CYAN -NoNewline 
-    } else {
-        Write-MyLogger "Starting Install of RBS on " CYAN -NoNewline 
-    }
-    Write-MyLogger "$Computer" GREEN -NoNewline -NoTimeStamp
-    Write-MyLogger ". Please wait..." CYAN -NoTimeStamp
-
-    #region Copy RBS files, Install RBS, Delete RBS Files
-    if (-not $ChangeRBSCredentialOnly) {
-        #region Copy the RubrikBackupService files to the remote computer
-        Write-MyLogger "Copying RBS files to $Computer. Please wait" CYAN
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                New-Item -Path "C:\Temp\RubrikBackupService" -type directory -Force | out-null
-            }
-            $Session = New-PSSession -ComputerName $Computer 
-            foreach ($file in Get-ChildItem C:\Temp\RubrikBackupService) {
-                Write-MyLogger "  > Copying $file to $computer"
-                Copy-Item -ToSession $Session $file -Destination C:\Temp\RubrikBackupService | out-Null
-            }
-            Remove-PSSession -Session $Session
-        } catch {
-            Write-MyLogger "ERROR! There was an error copying the RBS to $Computer. Skipping install on this computer. Please try manually" RED
-            #Write-MyLogger "$($error[0].exception.message)" RED
-            Write-MyLogger $LineSepDashes
-            continue
-        }
-        #endregion
-
-
-
-        #Region Install the RBS on the Remote Computer
-        Write-MyLogger "Installing RBS on $Computer. Please wait" CYAN
-        $Session = New-PSSession -ComputerName $Computer 
-        try {
-            Invoke-Command -Session $Session -ScriptBlock {
-                Start-Process -FilePath "C:\Temp\RubrikBackupService\RubrikBackupService.msi" -ArgumentList "/quiet" -Wait
-                #added sleep to give a few extra seconds for service to install/start on it's own
-                sleep 3
-            }        
-        } catch {
-            Write-MyLogger "ERROR! There was an error installing RBS to $Computer. Please try manually" RED
-            #Write-MyLogger "$($error[0].exception.message)" RED
-            Write-MyLogger $LineSepDashes
-            continue    
-        }
-        Remove-PSSession -Session $Session
-        #EndRegion Install the RBS on the Remote Computer
-
-
-
-        #Region remove RBS files
-        Write-MyLogger "Deleting RBS files on $Computer. Please wait" CYAN
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                Remove-Item -Path "C:\Temp\RubrikBackupService" -recurse -Force | out-null
-            }
-        } catch {
-            Write-MyLogger "ERROR! There was an error removing RBS installer files. Please try manually" RED
-            #Write-MyLogger "$($error[0].exception.message)" RED
-            Write-MyLogger $LineSepDashes
-            continue
-        }
-        #EndRegion Remove RBS Files
-    }
-    #EndRegion Copy RBS files, Install RBS, Delete RBS Files
-
-
-    #Region Set Run as user. Skip if RBSUserName=LocalSystem
-    if ($RBSUserName -eq "LocalSystem") {
-        Write-MyLogger "Running Rubrik Backup Service as LocalSystem" CYAN
-    } else {
-        #Region adding username to administrators on remote computer
-        if ($SkipAddToAdministratorsGroup) {
-            Write-MyLogger "Skipping adding user $RBSUserName to administrators group" Yellow
+        Write-MyLogger "Testing connectivity to $Computer to WinRM port/service (TCP5985). Please wait." CYAN
+        #Using Test-NetConnection (Windows only) to verify WinRM port is open and service running, which is what Invoke-Command uses
+        #NOT using Ping incase it is disabled; no ping != unavailable
+        if ( Test-NetConnection -ComputerName $computer -CommonTCPPort winrm -InformationLevel quiet -ErrorAction SilentlyContinue -WarningAction SilentlyContinue) {
+            Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
         } else {
-            Start-Sleep 5
-            Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
+            Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
+            continue
+        }  
+
+        if ($ChangeRBSCredentialOnly){
+            Write-MyLogger "Changing RBS Password on " CYAN -NoNewline 
+        } else {
+            Write-MyLogger "Starting Install of RBS on " CYAN -NoNewline 
+        }
+        Write-MyLogger "$Computer" GREEN -NoNewline -NoTimeStamp
+        Write-MyLogger ". Please wait..." CYAN -NoTimeStamp
+
+        #region Copy RBS files, Install RBS, Delete RBS Files
+        if (-not $ChangeRBSCredentialOnly) {
+            #region Copy the RubrikBackupService files to the remote computer
+            Write-MyLogger "Copying RBS files to $Computer. Please wait" CYAN
             try {
                 Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                    param ($user)
-                    if ( $(Get-LocalGroupMember administrators).name -contains $user) {
-                        Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
-                    } else {
-                        Add-LocalGroupMember -Group "Administrators" -Member $user
-                    }
-                } -ArgumentList $RBSUserName
+                    New-Item -Path "C:\Temp\RubrikBackupService" -type directory -Force | out-null
+                }
+                $Session = New-PSSession -ComputerName $Computer 
+                foreach ($file in Get-ChildItem C:\Temp\RubrikBackupService) {
+                    Write-MyLogger "  > Copying $file to $computer"
+                    Copy-Item -ToSession $Session $file -Destination C:\Temp\RubrikBackupService | out-Null
+                }
+                Remove-PSSession -Session $Session
             } catch {
-                Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
+                Write-MyLogger "ERROR! There was an error copying the RBS to $Computer. Skipping install on this computer. Please try manually" RED
+                #Write-MyLogger "$($error[0].exception.message)" RED
+                Write-MyLogger $LineSepDashes
+                continue
+            }
+            #endregion
+
+
+
+            #Region Install the RBS on the Remote Computer
+            Write-MyLogger "Installing RBS on $Computer. Please wait" CYAN
+            $Session = New-PSSession -ComputerName $Computer 
+            try {
+                Invoke-Command -Session $Session -ScriptBlock {
+                    Start-Process -FilePath "C:\Temp\RubrikBackupService\RubrikBackupService.msi" -ArgumentList "/quiet" -Wait
+                    #added sleep to give a few extra seconds for service to install/start on it's own
+                    sleep 3
+                }        
+            } catch {
+                Write-MyLogger "ERROR! There was an error installing RBS to $Computer. Please try manually" RED
+                #Write-MyLogger "$($error[0].exception.message)" RED
+                Write-MyLogger $LineSepDashes
+                continue    
+            }
+            Remove-PSSession -Session $Session
+            #EndRegion Install the RBS on the Remote Computer
+
+
+
+            #Region remove RBS files
+            Write-MyLogger "Deleting RBS files on $Computer. Please wait" CYAN
+            try {
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    Remove-Item -Path "C:\Temp\RubrikBackupService" -recurse -Force | out-null
+                }
+            } catch {
+                Write-MyLogger "ERROR! There was an error removing RBS installer files. Please try manually" RED
+                #Write-MyLogger "$($error[0].exception.message)" RED
+                Write-MyLogger $LineSepDashes
+                continue
+            }
+            #EndRegion Remove RBS Files
+        }
+        #EndRegion Copy RBS files, Install RBS, Delete RBS Files
+
+
+        #Region Set Run as user. Skip if RBSUserName=LocalSystem
+        if ($RBSUserName -eq "LocalSystem") {
+            Write-MyLogger "Running Rubrik Backup Service as LocalSystem" CYAN
+        } else {
+            #Region adding username to administrators on remote computer
+            if ($SkipAddToAdministratorsGroup) {
+                Write-MyLogger "Skipping adding user $RBSUserName to administrators group" Yellow
+            } else {
+                Start-Sleep 5
+                Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
+                try {
+                    Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                        param ($user)
+                        if ( $(Get-LocalGroupMember administrators).name -contains $user) {
+                            Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
+                        } else {
+                            Add-LocalGroupMember -Group "Administrators" -Member $user
+                        }
+                    } -ArgumentList $RBSUserName
+                } catch {
+                    Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
+                    continue
+                }
+            }
+            #EndRegion adding username to administrators on remote computer
+
+
+            #Region Setting SeServiceLoginRight on remote computer to allow run as a service
+            #From: https://stackoverflow.com/questions/313831/using-powershell-how-do-i-grant-log-on-as-service-to-an-account
+            Write-MyLogger "Granting ""Log on as a Service"" to $RBSUserName on $computer" Cyan
+            try {
+                Invoke-Command -ComputerName $computer -Script {
+                    param(
+                        [string] $username,
+                        [string] $computerName
+                    )
+                    $tempPath = [System.IO.Path]::GetTempPath()
+                    $import = Join-Path -Path $tempPath -ChildPath "import.inf"
+                    if(Test-Path $import) { Remove-Item -Path $import -Force }
+                    $export = Join-Path -Path $tempPath -ChildPath "export.inf"
+                    if(Test-Path $export) { Remove-Item -Path $export -Force }
+                    $secedt = Join-Path -Path $tempPath -ChildPath "secedt.sdb"
+                    if(Test-Path $secedt) { Remove-Item -Path $secedt -Force }
+                    try {
+                        #Write-Host ("  > Granting SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName)
+                        $sid = ((New-Object System.Security.Principal.NTAccount($username)).Translate([System.Security.Principal.SecurityIdentifier])).Value
+                        Write-Host "$using:LineIndentSpaces  > Exporting Local Policy to temp file"
+                        secedit /export /cfg $export | out-null
+                        $sids = (Select-String $export -Pattern "SeServiceLogonRight").Line
+                        if ($sids -match $sid) {
+                            Write-Host "$using:LineIndentSpaces  > User currently granted SeServiceLoginRight - Nothing to do!" -ForegroundColor GREEN
+                        } else {
+                            foreach ($line in @("[Unicode]", 
+                                                "Unicode=yes", 
+                                                "[System Access]", 
+                                                "[Event Audit]", 
+                                                "[Registry Values]", 
+                                                "[Version]", 
+                                                "signature=`"`$CHICAGO$`"", 
+                                                "Revision=1", 
+                                                "[Profile Description]", 
+                                                "Description=GrantLogOnAsAService security template", 
+                                                "[Privilege Rights]", 
+                                                "$sids,*$sid")){
+                                Add-Content $import $line
+                            }
+                            Write-Host "$using:LineIndentSpaces  > Importing Local Policy with updated SeServiceLoginRight"
+                            secedit /import /db $secedt /cfg $import | out-null
+                            Write-Host "$using:LineIndentSpaces  > Applying modified Local Policy"
+                            secedit /configure /db $secedt | out-null
+                            Write-Host "$using:LineIndentSpaces  > Refreshing Group Policy to apply updates to Local Policy"
+                            gpupdate /force | out-null                    
+                            Remove-Item -Path $import -Force | out-null
+                            Remove-Item -Path $secedt -Force | out-null
+                        }
+                        Remove-Item -Path $export -Force | out-null
+                    } catch {
+                        Write-MyLogger ("Failed to grant SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName) RED
+                        $error[0]
+                    }
+                } -ArgumentList ($RBSUserName, $computer)        
+            } catch {
+                Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer ""Log on as a Service"". Please check manually" RED
+                continue
+            }
+            #EndRegion Setting SeServiceLoginRight on remote computer to allow run as a service
+        }
+        #EndRegion Set Run as user. Skip if RBSUserName=LocalSystem
+
+
+
+        #Region OpenFirewall ports (windows builtin firewall only)
+        if ($OpenWindowsFirewall) {
+            #WARNING: Opens Windows Firewall to all IPs
+            try {
+                Write-MyLogger "Adding Firewall Rule for 12800/12801 TCP from any remote IP on all profiles"  Cyan
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    $RBSFirewallRule = @{
+                        DisplayName  = "Rubrik Backup Service"
+                        Profile      = @('Domain', 'Private', 'Public') 
+                        Direction    = 'Inbound'
+                        Action       = 'Allow'
+                        Protocol     = 'TCP'
+                        LocalPort    = @(12800, 12801)
+                    }
+                    if ( Get-NetFirewallRule | Where-Object { $_.displayname -match $RBSFirewallRule.DisplayName } ){
+                        Write-Host "$using:LineIndentSpaces  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
+                    } else {
+                        $result = New-NetFirewallRule @RBSFirewallRule
+                    }
+                } 
+            } catch {
+                Write-MyLogger "ERROR! Could not open windows firewall ports (12800/12801TCP). Please check manually" RED
                 continue
             }
         }
-        #EndRegion adding username to administrators on remote computer
+        #EndRegion OpenFirewall ports (windows firewall only)
 
 
-        #Region Setting SeServiceLoginRight on remote computer to allow run as a service
-        #From: https://stackoverflow.com/questions/313831/using-powershell-how-do-i-grant-log-on-as-service-to-an-account
-        Write-MyLogger "Granting ""Log on as a Service"" to $RBSUserName on $computer" Cyan
-        try {
-            Invoke-Command -ComputerName $computer -Script {
-                param(
-                    [string] $username,
-                    [string] $computerName
-                )
-                $tempPath = [System.IO.Path]::GetTempPath()
-                $import = Join-Path -Path $tempPath -ChildPath "import.inf"
-                if(Test-Path $import) { Remove-Item -Path $import -Force }
-                $export = Join-Path -Path $tempPath -ChildPath "export.inf"
-                if(Test-Path $export) { Remove-Item -Path $export -Force }
-                $secedt = Join-Path -Path $tempPath -ChildPath "secedt.sdb"
-                if(Test-Path $secedt) { Remove-Item -Path $secedt -Force }
-                try {
-                    #Write-Host ("  > Granting SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName)
-                    $sid = ((New-Object System.Security.Principal.NTAccount($username)).Translate([System.Security.Principal.SecurityIdentifier])).Value
-                    Write-Host "$using:LineIndentSpaces  > Exporting Local Policy to temp file"
-                    secedit /export /cfg $export | out-null
-                    $sids = (Select-String $export -Pattern "SeServiceLogonRight").Line
-                    if ($sids -match $sid) {
-                        Write-Host "$using:LineIndentSpaces  > User currently granted SeServiceLoginRight - Nothing to do!" -ForegroundColor GREEN
-                    } else {
-                        foreach ($line in @("[Unicode]", 
-                                            "Unicode=yes", 
-                                            "[System Access]", 
-                                            "[Event Audit]", 
-                                            "[Registry Values]", 
-                                            "[Version]", 
-                                            "signature=`"`$CHICAGO$`"", 
-                                            "Revision=1", 
-                                            "[Profile Description]", 
-                                            "Description=GrantLogOnAsAService security template", 
-                                            "[Privilege Rights]", 
-                                            "$sids,*$sid")){
-                            Add-Content $import $line
-                        }
-                        Write-Host "$using:LineIndentSpaces  > Importing Local Policy with updated SeServiceLoginRight"
-                        secedit /import /db $secedt /cfg $import | out-null
-                        Write-Host "$using:LineIndentSpaces  > Applying modified Local Policy"
-                        secedit /configure /db $secedt | out-null
-                        Write-Host "$using:LineIndentSpaces  > Refreshing Group Policy to apply updates to Local Policy"
-                        gpupdate /force | out-null                    
-                        Remove-Item -Path $import -Force | out-null
-                        Remove-Item -Path $secedt -Force | out-null
-                    }
-                    Remove-Item -Path $export -Force | out-null
-                } catch {
-                    Write-MyLogger ("Failed to grant SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName) RED
-                    $error[0]
+
+        #Region Set RBS to run as service account
+        if ( $RBSUserName -eq "LocalSystem" -and -not $ChangeRBSCredentialOnly ) {
+            Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
+        } else {
+            #Set Service to run as RBSUserName/RBSPassword
+            Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
+            try {
+                Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
+            } catch {
+                Write-MyLogger "ERROR! Did not set the username $RBSUserName properly on $Computer. Please check manually"
+                continue
+            }        
+            #Restart RBS for new credentials to take effect
+            Start-Sleep 5
+            Write-MyLogger "Restarting RBS service on $computer" Cyan
+            try {
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    get-service "rubrik backup service" | Stop-Service -ErrorAction stop
+                    Start-Sleep 2
+                    get-service "rubrik backup service" | Start-Service -ErrorAction Stop
                 }
-            } -ArgumentList ($RBSUserName, $computer)        
-        } catch {
-            Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer ""Log on as a Service"". Please check manually" RED
-            continue
-        }
-        #EndRegion Setting SeServiceLoginRight on remote computer to allow run as a service
-    }
-    #EndRegion Set Run as user. Skip if RBSUserName=LocalSystem
-
-
-
-    #Region OpenFirewall ports (windows builtin firewall only)
-    if ($OpenWindowsFirewall) {
-        #WARNING: Opens Windows Firewall to all IPs
-        try {
-            Write-MyLogger "Adding Firewall Rule for 12800/12801 TCP from any remote IP on all profiles"  Cyan
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                $RBSFirewallRule = @{
-                    DisplayName  = "Rubrik Backup Service"
-                    Profile      = @('Domain', 'Private', 'Public') 
-                    Direction    = 'Inbound'
-                    Action       = 'Allow'
-                    Protocol     = 'TCP'
-                    LocalPort    = @(12800, 12801)
-                }
-                if ( Get-NetFirewallRule | Where-Object { $_.displayname -match $RBSFirewallRule.DisplayName } ){
-                    Write-Host "$using:LineIndentSpaces  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
-                } else {
-                    $result = New-NetFirewallRule @RBSFirewallRule
-                }
-            } 
-        } catch {
-            Write-MyLogger "ERROR! Could not open windows firewall ports (12800/12801TCP). Please check manually" RED
-            continue
-        }
-    }
-    #EndRegion OpenFirewall ports (windows firewall only)
-
-
-
-    #Region Set RBS to run as service account
-    if ( $RBSUserName -eq "LocalSystem" -and -not $ChangeRBSCredentialOnly ) {
-        Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
-    } else {
-        #Set Service to run as RBSUserName/RBSPassword
-        Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
-        try {
-            Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
-        } catch {
-            Write-MyLogger "ERROR! Did not set the username $RBSUserName properly on $Computer. Please check manually"
-            continue
-        }        
-        #Restart RBS for new credentials to take effect
-        Start-Sleep 5
-        Write-MyLogger "Restarting RBS service on $computer" Cyan
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                get-service "rubrik backup service" | Stop-Service 
-                Start-Sleep 2
-                get-service "rubrik backup service" | Start-Service
+            } catch {
+                Write-MyLogger "ERROR! Could not restart service properly on $Computer. Please check manually"
+                continue
             }
-        } catch {
-            Write-MyLogger "ERROR! Could not restart service properly on $Computer. Please check manually"
-            continue
         }
+        #EndRegion Set RBS to run as service account
     }
-    #EndRegion Set RBS to run as service account
-
+    #endRegion Install RBS
 
 
     #Region Add Windows Host to RSC
     if ($RubrikClusterObject -and -not $ChangeRBSCredentialOnly) {
         Write-MyLogger "Adding Host to RSC via API" CYAN
-        $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.ID
-        if ($result.errors) {
-            Write-MyLogger "ERROR! Could not add host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)"
-            Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
-        } else {
+        try {
+            $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.ID
             Write-MyLogger "Success! Added host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)" GREEN
             Write-MyLogger "  > RSC Object ID: " GREEN -NoNewLine
             Write-MyLogger "$($result.data[0].hostSummary.id)" white -NoTimeStamp
+        } catch {
+            Write-MyLogger "ERROR! Could not add host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)" Red
+            Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
+            continue
         }
     }
     #endRegion Add Windows Host to RSC
 
 
 
-    #Region Apply SLA to new SQL objects
+    #Region Apply SLA to new SQL objects (standalone SQL only and will recognize Availability Groups--does NOT import Failover Cluster objects)
     if ($ApplySLAtoSqlObject) {
-        Write-MyLogger "Getting List of registered MSSQL instances registered to $($RubrikClusterObject.Name) / $($RubrikClusterObject.id)" CYAN
+        Write-MyLogger "Getting List of registered MSSQL instances registered to " Cyan -NoNewLine
+        Write-MyLogger "$($RubrikClusterObject.Name)/$($RubrikClusterObject.id)" White -NoTimeStamp
         $i          = 0 
         $sleeptime  = 10
         $SleepMax   = 300
@@ -972,7 +988,7 @@ foreach($Computer in $($ComputerName -split ',')){
             #Must've appeared, lets apply the SLA to the new object
             $RscMssqlServer = $RscMssqlServers | Where-Object {$_.name -eq $Computer}
             Write-MyLogger "  > MSSQL server object $($RscMssqlServer.Name) found! Registered with $($RubrikClusterObject.Name)" GREEN
-            Write-MyLogger "  > Applying SLA ""$($RscSlaDomainSQL.Name)"" to object" CYAN
+            Write-MyLogger "  > Applying SLA ""$($RscSlaDomainSQL.Name)"" to object" Cyan
             #Region Mutation and vars
             $QueryString = '
             mutation AssignMssqlSLAMutation($input: AssignMssqlSlaDomainPropertiesAsyncInput!) {
@@ -1024,20 +1040,23 @@ foreach($Computer in $($ComputerName -split ',')){
 
     if ($ChangeRBSCredentialOnly) {
         Write-MyLogger "Changing RBS Credentials on " -NoNewline CYAN
+    } elseif ($SkipRBSinstall) {
+        Write-MyLogger "Register RBS on " -NoNewLine CYAN
     } else {
-        Write-MyLogger "Install of RBS on " -NoNewline CYAN
+        Write-MyLogger "Install of RBS on " -NoNewline GREEN
     }
-    Write-MyLogger "$computer complete" GREEN -NoTimeStamp
+    Write-MyLogger "$computer " White -NoTimeStamp -NoNewLine
+    Write-MyLogger "complete" GREEN -NoTimeStamp
 } 
 #EndRegion Loop Through Computer List
 
 
 
 #Cleanup RBS downloads from $path folder (ie C:\Temp)
-if (-not $ChangeRBSCredentialOnly) {
-    Remove-Item -Path $OutFile -Force | out-null
-    Remove-Item -Path "$path\RubrikBackupService" -Force -recurse | out-null
-}
+#if (-not $ChangeRBSCredentialOnly -or -not $SkipRBSinstall) {
+    Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue | out-null
+    Remove-Item -Path "$path\RubrikBackupService" -Force -recurse -ErrorAction SilentlyContinue| out-null
+#}
 
 
 
