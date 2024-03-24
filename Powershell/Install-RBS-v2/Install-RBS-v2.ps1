@@ -23,6 +23,9 @@
     - If multiple matches, prompt for which cluster
     - If using RSC method, RBS download will be from the IP of the first node in the cluster
 
+    ADDED 2024.03.11 - Can apply SLA to SQL Object that is automaticaly added to RSC when RBS discovers SQL
+    - use "ApplySLAtoSqlObject" command line argument to pass the name or UUID of the SLA to apply to SQL
+
 
 .NOTES
     Updated 2023.08.26 by David Oslager for community usage
@@ -88,14 +91,22 @@ param(
     #Skip RBS install, change RBS user/pw only
     [switch]$ChangeRBSCredentialOnly,
 
-    #Create rule to Open Windows Firewall ports (12800/12801 TCP)
+    #Skip RBS install, skip RBS user/pw change, register with RSC only
+    #assumes RBS was installed and is fuctioning through some other mechanism, such as Ansible, SCCM, etc
+    [switch]$SkipRBSinstall,
+
+    #Create rule to Open Windows Firewall ports (12800/12801 TCP). Creates explicit rule for source ANY to host
     [switch]$OpenWindowsFirewall,
 
     #Local Location to store download of RBS
     [string]$Path = "c:\temp",
 
-    # Path to Service account XML file
+    # Path to Service account XML file. Must be created using Set-RSCServiceAccountFile from RubrikSecurityCloud PS Module
     [string] $RSCserviceAccountXML,
+
+    # Name or ID of SLA to apply to SQL Object after RBS is installed
+    # Can be partial match for name, will display list of matches to choose from
+    [string] $ApplySLAtoSqlObject,
 
     # Shows details from RSC GraphQL searches-similar to Verbose, but without the builtin verbose statements, used for debugging
     [switch] $ShowDetails,
@@ -116,8 +127,8 @@ if (-not $IsWindows) {
 
 
 #Suppress progress bars from commands. Will set back to oldProgressPreference at end of script
-$oldProgressPreference = $progressPreference; 
-$progressPreference = 'SilentlyContinue'
+$oldProgressPreference = $Global:progressPreference
+$Global:progressPreference = 'SilentlyContinue'
 
 
 #################################################################################################
@@ -231,7 +242,8 @@ Function Write-MyLogger {
 } #end Write-MyLogger
 
 
-
+#Region Function New-Host
+#adds Windows Host to RSC
 function New-Host(){
     param(
         [string[]]$inputHost,
@@ -261,8 +273,120 @@ function New-Host(){
     }
     $response = Invoke-Rsc -GqlQuery $QueryString -Var $variables
     return $response
-} #End Function New-Host
+} 
+#endRegion Function New-Host
 
+
+#Region Function Select-RscSlaDomainTable
+Function Select-RscSlaDomainTable {
+    Param ( 
+        [string] $SlaDomain
+    )
+
+    #Create Table of RscSlaDomains and have end user pick correct one
+    if ($SlaDomain -match $ValidGUIDRegex) {
+        #looking for SLA with UUID
+        Write-MyLogger "SLA matches UUID" Yellow
+        try {
+            $RscSlaDomains = Get-RscSla
+        } catch {
+            Write-MyLogger "ERROR! There was a problem getting a list of SLA Domains" RED
+        }
+        $RscSlaDomain = $RscSlaDomains | Where-Object {$_.id -eq $SlaDomain}
+        if ($null -eq $RscSlaDomain) {
+            Write-MyLogger "ERROR! SLA with UUID $SlaDomain was not found. Please try again" RED
+            exit
+        }
+
+    } else {
+        #pull list of SLAs matching name and if more than one, prompt to select
+        $RscSlaDomains = Get-RscSla -name $SlaDomain
+        if ($RscSlaDomains.count -eq 0) {
+            #if result = 0 throw error and quit
+            Write-MyLogger "ERROR! No SLA Domains were found. Please verify and try again" RED
+            exit
+        } elseif ($RscSlaDomains.count -eq 1) {
+            #if result = 1 get ID from object
+            $RscSlaDomain = $RscSlaDomains
+        } else {
+            #if result > 1, build pretty table and ask user to select from list
+            $RscSlaDomainsNew = @()
+            foreach ($RscSlaDomain_temp in $RscSlaDomains) {
+                $RscSlaDomainNew_temp = New-Object -type psobject
+                $RscSlaDomainNew_temp | Add-Member -Type NoteProperty -name "Name"        -Value $RscSlaDomain_temp.Name
+                $RscSlaDomainNew_temp | Add-Member -Type NoteProperty -name "id"          -Value $RscSlaDomain_temp.id
+                $BaseFreqDuration     = $RscSlaDomain_temp.BaseFrequency.DurationField
+                $BaseFreqUnit         = $RscSlaDomain_temp.BaseFrequency.Unit.ToString()[0].ToString().ToLower()
+                $RscSlaDomainNew_temp | Add-Member -Type NoteProperty -name "BaseFreq"    -Value "$BaseFreqDuration$BaseFreqUnit"
+                $RscSlaDomainsNew += $RscSlaDomainNew_temp
+            }
+
+            Write-MyLogger "Multiple SLA Domains found matching $SlaDomain. Please choose which SLA to use" Yellow
+            $len_digits         = (@($RscSlaDomainsNew.count.tostring().length,3) | Measure-object -maximum).Maximum
+            $len_name           = ($RscSlaDomainsNew.name           | measure-object -maximum -property length).maximum
+            $len_id             = ($RscSlaDomainsNew.Id             | measure-object -maximum -property length).maximum
+            $len_BaseFreq       = ($RscSlaDomainsNew.BaseFreq       | measure-object -maximum -property length).maximum
+            $len_total          = ($len_digits + $len_name + $len_id + $len_BaseFreq + 15)
+    
+            #Output column headers and line separators
+            Write-MyLogger $("-" * $len_total) -NoTimeStamp
+            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_id}   {3,-$len_BaseFreq}" -f "Num", "Name", "ID", "BaseFreq") -NoTimeStamp
+            Write-MyLogger $("-" * $len_total) -NoTimeStamp
+    
+            $i=1
+            foreach ($RscSlaDomainNew in $RscSlaDomainsNew) {
+                # Output Table with number in first column for user to pick from
+                Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_id}   {3,-$len_BaseFreq}" -f $i, $RscSlaDomainNew.Name, $RscSlaDomainNew.id, $RscSlaDomainNew.BaseFreq) -NoTimeStamp
+                $i++
+            }
+            Write-MyLogger $("-" * $len_total) -NoTimeStamp
+        
+            do {
+                try {
+                    $SelectedIndex=(Read-Host -Prompt "Select SLA Domain Number" -erroraction stop).ToInt32($null) 
+                } catch {
+                    Write-MyLogger "Not a proper response. Pick a number from the NUM column. Please try again" RED -NoTimeStamp 
+                }
+            } while ($SelectedIndex -notin (1..$($RscSlaDomainsNew.count)))
+    
+            $RscSlaDomain = $RscSlaDomainsNew[$SelectedIndex-1]
+            #Write-MyLogger "You selected $($RscSlaDomain.Name) ($($RscSlaDomain.Id))"
+            #Write-MyLogger -NoTimeStamp
+        }
+    }
+    return $RscSlaDomain
+}
+#EndRegion Function Select-RscSlaDomainTable
+
+
+
+
+#Region Get List of MSSQL Instance
+Function Get-MyRscMssqlInstances {
+    #region QueryString and Vars
+    $QueryString = '
+    query MssqlHostHierarchyHostListQuery($filter: [Filter!]) {
+        mssqlTopLevelDescendants(filter: $filter) {
+            nodes {
+            id
+            name
+            }
+        }
+    }
+    '
+    $variables = @{
+        filter    = @( 
+            @{
+            field    = "CLUSTER_ID"
+            texts    = @($($RubrikClusterObject.id))
+            }
+        )
+    }
+    #Endregion QueryString and Vars
+    $RscMssqlServers = (Invoke-Rsc -GqlQuery $QueryString -Var $variables).Nodes
+    return $RscMssqlServers | Select Name, ID
+}
+#EndRegion Get List of MSSQL Instance
 
 
 
@@ -302,7 +426,7 @@ if ($ChangeRBSCredentialOnly) {
         $XMLContent = Get-Content $RSCserviceAccountXML
     }
     catch {
-        Write-MyLogger "Service Account XML is not valid, please verify and retru" RED
+        Write-MyLogger "Service Account XML is not valid, please verify and retry" RED
         exit
     }
 
@@ -371,7 +495,7 @@ if ($ChangeRBSCredentialOnly) {
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "Name"           -Value $RSCRubrikCluster_temp.Name
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "DefaultAddress" -Value $RSCRubrikCluster_temp.DefaultAddress
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "Status"         -Value $RSCRubrikCluster_temp.Status
-        $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "UUID"           -Value $RSCRubrikCluster_temp.id
+        $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "ID"             -Value $RSCRubrikCluster_temp.id
         $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "IPAddress"      -Value $RSCRubrikCluster_temp.clusterNodeConnection.Nodes.ipAddress
         if ($RSCRubrikCluster_temp.clusterNodeConnection.Nodes.ipAddress -is [array] ) {
             $RSCRubrikCluster | Add-Member -Type NoteProperty -Name "IPAddress0" -Value $RSCRubrikCluster_temp.clusterNodeConnection.Nodes.ipAddress[0]
@@ -389,11 +513,12 @@ if ($ChangeRBSCredentialOnly) {
             Write-MyLogger "RSCCluster[$i].Name             = $($RSCRubrikCluster.Name)" CYAN
             Write-MyLogger "RSCCluster[$i].DefaultAddress   = $($RSCRubrikCluster.DefaultAddress)" CYAN
             Write-MyLogger "RSCCluster[$i].Status           = $($RSCRubrikCluster.Status)" CYAN
-            Write-MyLogger "RSCCluster[$i].UUID             = $($RSCRubrikCluster.UUID)" CYAN
+            Write-MyLogger "RSCCluster[$i].ID               = $($RSCRubrikCluster.ID)" CYAN
             Write-MyLogger "RSCCluster[$i].IPAddress        = $($RSCRubrikCluster.IPAddress)" CYAN
             Write-MyLogger "RSCCluster[$i].IPAddress0       = $($RSCRubrikCluster.IPAddress0)" CYAN
-            Write-MyLogger $LineSepDashesFull
-        }
+        }            
+        Write-MyLogger $LineSepDashesFull
+
     }
 
     #Find the right cluster based on input
@@ -418,23 +543,22 @@ if ($ChangeRBSCredentialOnly) {
         #create pretty table with cluster names and info for use to pick from interactively
         #Calculate width of each column based on max length, and then calculate total length as sum of all columns
         $len_digits         = (@($RSCRubrikClusters.count.tostring().length,3) | Measure-object -maximum).Maximum
-        $len_name           = ($RSCRubrikClusters.name           | measure-object -maximum -property length).maximum
-        $len_DefaultAddress = ($RSCRubrikClusters.DefaultAddress | measure-object -maximum -property length).maximum
-        #$len_Status         = ($RSCRubrikClusters.Status         | measure-object -maximum -property length).maximum
-        $len_Status         = 12 #Had to change this because using Invoke-RSC returns as a value, not as a string
-        $len_UUID           = ($RSCRubrikClusters.UUID           | measure-object -maximum -property length).maximum
-        $len_IPAddress0     = ($RSCRubrikClusters.IPAddress0     | measure-object -maximum -property length).maximum
-        $len_total          = ($len_digits + $len_name + $len_DefaultAddress + $len_Status + $len_UUID + $len_IPAddress0 + 16)
+        $len_name           = ($RSCRubrikClusters.name              | measure-object -maximum -property length).maximum
+        $len_DefaultAddress = ($RSCRubrikClusters.DefaultAddress    | measure-object -maximum -property length).maximum
+        $len_Status         = ($RSCRubrikClusters.Status.ToString() | measure-object -maximum -property length).maximum
+        $len_ID             = ($RSCRubrikClusters.ID                | measure-object -maximum -property length).maximum
+        $len_IPAddress0     = ($RSCRubrikClusters.IPAddress0        | measure-object -maximum -property length).maximum
+        $len_total          = ($len_digits + $len_name + $len_DefaultAddress + $len_Status + $len_ID + $len_IPAddress0 + 16)
 
         #Output column headers and line separators
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
-        Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f "Num", "Name", "DefaultAddress", "Status", "UUID", "IPAddress[0]") -NoTimeStamp
+        Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_ID}   {5,-$len_IPAddress0}" -f "Num", "Name", "DefaultAddress", "Status", "ID", "IPAddress[0]") -NoTimeStamp
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
 
         $i=1
         foreach ($RSCRubrikCluster in $RSCRubrikClusters) {
             # Output Table with number in first column for user to pick from
-            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_UUID}   {5,-$len_IPAddress0}" -f $i, $RSCRubrikCluster.Name, $RSCRubrikCluster.DefaultAddress, $RSCRubrikCluster.Status, $RSCRubrikCluster.UUID, $RSCRubrikCluster.IPAddress0) -NoTimeStamp
+            Write-MyLogger ("{0,$($len_digits)}  {1,-$len_name}   {2,-$len_DefaultAddress}   {3,-$len_Status}   {4,-$len_ID}   {5,-$len_IPAddress0}" -f $i, $RSCRubrikCluster.Name, $RSCRubrikCluster.DefaultAddress, $RSCRubrikCluster.Status, $RSCRubrikCluster.ID, $RSCRubrikCluster.IPAddress0) -NoTimeStamp
             $i++
         }
         Write-MyLogger $("-" * $len_total) -NoTimeStamp
@@ -452,9 +576,9 @@ if ($ChangeRBSCredentialOnly) {
         Write-MyLogger -NoTimeStamp
 
     }
-    Write-MyLogger $LineSepDashes
+    Write-MyLogger $LineSepDashes -NoTimeStamp
     $RubrikClusterObject | Format-List *
-    Write-MyLogger $LineSepDashes
+    Write-MyLogger $LineSepDashes -NoTimeStamp
     #$RBSDownloadURL =  "https://$($RubrikClusterObjectIPAddress0)/connector/RubrikBackupService.zip"
     #Write-MyLogger "URL: $RBSDownloadURL"
     #EndRegion Get a list of clusters from RSC
@@ -470,6 +594,22 @@ if ($ChangeRBSCredentialOnly) {
     }
 }
 #EndRegion RubrikCluster
+
+
+
+#Region Get SLA ID for SQL server object
+if ($ApplySLAtoSqlObject) {
+    if (-not $connection) {
+        Write-MyLogger "ERROR! Not connected to RSC. Please start over and supply RSC service account" RED
+        exit
+    } else {
+        Write-MyLogger "Looking up SLA Domain ($ApplySLAtoSqlObject) for SQL Object" Yellow
+        $RscSlaDomainSQL = Select-RscSlaDomainTable -SlaDomain $ApplySLAtoSqlObject
+    }
+    Write-MyLogger "Using SLA Domain Name ""$($RscSlaDomainSQL.Name)"" ($($RscSlaDomainSQL.id))" GREEN
+}
+#EndRegion Get SLA ID for SQL server object
+
 
 
 #Region ComputerName(s)
@@ -488,7 +628,9 @@ if ($ComputerName) {
 
 
 #Region User/Pw/Creds
-if ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
+if ($SkipRBSinstall) {
+    Write-MyLogger "SkipRBSInstall specified on command line, no Credential required" YELLOW
+} elseif ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
     #Credential supplied via command line and var type is a PSCredential
     Write-MyLogger "Credential specified. (user: $($RBSCredential.UserName))" CYAN
 } elseif ( $RBSCredential ) {
@@ -518,7 +660,9 @@ if ( $RBSCredential -and ($RBSCredential.GetType().Name -eq "PSCredential") ){
 }
 
 #Pull the user and password back out of the credential
-if ($RBSUserName -ne "LocalSystem") {
+if ($SkipRBSinstall) {
+    #Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS install" YELLOW
+} elseif ($RBSUserName -ne "LocalSystem") {
     $RBSUsername = $($RBSCredential.UserName)
     $RBSPassword = $($RBSCredential.GetNetworkCredential().Password)
     Write-Verbose "RBS Username:  $RBSUsername"
@@ -532,7 +676,9 @@ Write-MyLogger $LineSepHashesFull CYAN -NoTimeStamp
 #forcing PS6+ with the Requires at the top of the script. 
 #Do not want to use PS 5.x and dealing with SSL self signed certs
 #additional steps to invoke-command better run on PS7
-if (-not $ChangeRBSCredentialOnly) {
+if ($SkipRBSinstall) {
+    Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS download" YELLOW
+} elseif (-not $ChangeRBSCredentialOnly) {
     if (-not (test-path  $Path) ) {
         $null = New-Item -Path $Path -ItemType Directory 
     }
@@ -548,17 +694,12 @@ if (-not $ChangeRBSCredentialOnly) {
     Write-MyLogger "Downloading RBS zip file from $url" CYAN
     Write-MyLogger "Saving as $OutFile" CYAN
 
-    #Set progress to none - Invoke-Webrequest is annoying and lingers over the CLI after it is complete
-    $oldProgressPreference = $progressPreference; 
-    $progressPreference = 'SilentlyContinue'
     try {
         $null = Invoke-WebRequest -Uri $url -OutFile $OutFile -SkipCertificateCheck
     } catch {
         Write-MyLogger "ERROR! Could not download RBS zip file from $RubrikCluster. Please verify connectivity" Red
         exit 1
     }
-    #Set ProgressPref back to what it was before we did IWR
-    $progressPreference = $oldProgressPreference 
     Write-MyLogger "Expanding RBS locally to c:\Temp\RubrikBackupService\" CYAN
     Expand-Archive -LiteralPath $OutFile -DestinationPath "$path\RubrikBackupService" -Force
 }
@@ -570,267 +711,353 @@ if (-not $ChangeRBSCredentialOnly) {
 ##############################################################################################################
 #Region Loop Through Computer List
 foreach($Computer in $($ComputerName -split ',')){
+    #Region Install RBS
     Write-MyLogger $LineSepDashes
-    Write-MyLogger "Testing connectivity to $Computer to WinRM port/service (TCP5985). Please wait." CYAN
-    #if ((Test-Connection -ComputerName $Computer -Count 3 -quiet -ErrorAction SilentlyContinue)) {
-    #Using Test-NetConnection (Windows only) to verify WinRM port is open and service running, which is what Invoke-Command uses
-    #NOT using Ping incase it is disabled; no ping != unavailable
-    if ( Test-NetConnection -ComputerName $computer -CommonTCPPort winrm -InformationLevel quiet -ErrorAction SilentlyContinue -WarningAction SilentlyContinue) {
-        Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
+    if ($SkipRBSinstall) {
+        Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS install" YELLOW
     } else {
-        Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
-        continue
-    }  
-
-    if ($ChangeRBSCredentialOnly){
-        Write-MyLogger "Changing RBS Password on " CYAN -NoNewline 
-    } else {
-        Write-MyLogger "Starting Install of RBS on " CYAN -NoNewline 
-    }
-    Write-MyLogger "$Computer" GREEN -NoNewline -NoTimeStamp
-    Write-MyLogger ". Please wait..." CYAN -NoTimeStamp
-
-    #region Copy RBS files, Install RBS, Delete RBS Files
-    if (-not $ChangeRBSCredentialOnly) {
-        #region Copy the RubrikBackupService files to the remote computer
-        Write-MyLogger "Copying RBS files to $Computer. Please wait" CYAN
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                New-Item -Path "C:\Temp\RubrikBackupService" -type directory -Force | out-null
-            }
-            $Session = New-PSSession -ComputerName $Computer 
-            foreach ($file in Get-ChildItem C:\Temp\RubrikBackupService) {
-                Write-MyLogger "  > Copying $file to $computer"
-                Copy-Item -ToSession $Session $file -Destination C:\Temp\RubrikBackupService | out-Null
-            }
-            Remove-PSSession -Session $Session
-        } catch {
-            Write-MyLogger "ERROR! There was an error copying the RBS to $Computer. Skipping install on this computer. Please try manually" RED
-            #Write-MyLogger "$($error[0].exception.message)" RED
-            Write-MyLogger $LineSepDashes
-            continue
-        }
-        #endregion
-
-
-
-        #Region Install the RBS on the Remote Computer
-        Write-MyLogger "Installing RBS on $Computer. Please wait" CYAN
-        $Session = New-PSSession -ComputerName $Computer 
-        try {
-            Invoke-Command -Session $Session -ScriptBlock {
-                Start-Process -FilePath "C:\Temp\RubrikBackupService\RubrikBackupService.msi" -ArgumentList "/quiet" -Wait
-                #added sleep to give a few extra seconds for service to install/start on it's own
-                sleep 3
-            }        
-        } catch {
-            Write-MyLogger "ERROR! There was an error installing RBS to $Computer. Please try manually" RED
-            #Write-MyLogger "$($error[0].exception.message)" RED
-            Write-MyLogger $LineSepDashes
-            continue    
-        }
-        Remove-PSSession -Session $Session
-        #EndRegion Install the RBS on the Remote Computer
-
-
-
-        #Region remove RBS files
-        Write-MyLogger "Deleting RBS files on $Computer. Please wait" CYAN
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                Remove-Item -Path "C:\Temp\RubrikBackupService" -recurse -Force | out-null
-            }
-        } catch {
-            Write-MyLogger "ERROR! There was an error removing RBS installer files. Please try manually" RED
-            #Write-MyLogger "$($error[0].exception.message)" RED
-            Write-MyLogger $LineSepDashes
-            continue
-        }
-        #EndRegion Remove RBS Files
-    }
-    #EndRegion Copy RBS files, Install RBS, Delete RBS Files
-
-
-    #Region Set Run as user. Skip if RBSUserName=LocalSystem
-    if ($RBSUserName -eq "LocalSystem") {
-        Write-MyLogger "Running Rubrik Backup Service as LocalSystem" CYAN
-    } else {
-        #Region adding username to administrators on remote computer
-        if ($SkipAddToAdministratorsGroup) {
-            Write-MyLogger "Skipping adding user $RBSUserName to administrators group" Yellow
+        Write-MyLogger "Testing connectivity to $Computer to WinRM port/service (TCP5985). Please wait." CYAN
+        #Using Test-NetConnection (Windows only) to verify WinRM port is open and service running, which is what Invoke-Command uses
+        #NOT using Ping incase it is disabled; no ping != unavailable
+        if ( Test-NetConnection -ComputerName $computer -CommonTCPPort winrm -InformationLevel quiet -ErrorAction SilentlyContinue -WarningAction SilentlyContinue) {
+            Write-MyLogger "  > $Computer is reachable - will attempt to install/modify RBS" GREEN
         } else {
-            Start-Sleep 5
-            Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
+            Write-MyLogger "  > $Computer is not reachable, the RBS will not be installed/modified on this server!" RED
+            continue
+        }  
+
+        if ($ChangeRBSCredentialOnly){
+            Write-MyLogger "Changing RBS Password on " CYAN -NoNewline 
+        } else {
+            Write-MyLogger "Starting Install of RBS on " CYAN -NoNewline 
+        }
+        Write-MyLogger "$Computer" GREEN -NoNewline -NoTimeStamp
+        Write-MyLogger ". Please wait..." CYAN -NoTimeStamp
+
+        #region Copy RBS files, Install RBS, Delete RBS Files
+        if (-not $ChangeRBSCredentialOnly) {
+            #region Copy the RubrikBackupService files to the remote computer
+            Write-MyLogger "Copying RBS files to $Computer. Please wait" CYAN
             try {
                 Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                    param ($user)
-                    if ( $(Get-LocalGroupMember administrators).name -contains $user) {
-                        Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
-                    } else {
-                        Add-LocalGroupMember -Group "Administrators" -Member $user
-                    }
-                } -ArgumentList $RBSUserName
+                    New-Item -Path "C:\Temp\RubrikBackupService" -type directory -Force | out-null
+                }
+                $Session = New-PSSession -ComputerName $Computer 
+                foreach ($file in Get-ChildItem C:\Temp\RubrikBackupService) {
+                    Write-MyLogger "  > Copying $file to $computer"
+                    Copy-Item -ToSession $Session $file -Destination C:\Temp\RubrikBackupService | out-Null
+                }
+                Remove-PSSession -Session $Session
             } catch {
-                Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
+                Write-MyLogger "ERROR! There was an error copying the RBS to $Computer. Skipping install on this computer. Please try manually" RED
+                #Write-MyLogger "$($error[0].exception.message)" RED
+                Write-MyLogger $LineSepDashes
+                continue
+            }
+            #endregion
+
+
+
+            #Region Install the RBS on the Remote Computer
+            Write-MyLogger "Installing RBS on $Computer. Please wait" CYAN
+            $Session = New-PSSession -ComputerName $Computer 
+            try {
+                Invoke-Command -Session $Session -ScriptBlock {
+                    Start-Process -FilePath "C:\Temp\RubrikBackupService\RubrikBackupService.msi" -ArgumentList "/quiet" -Wait
+                    #added sleep to give a few extra seconds for service to install/start on it's own
+                    sleep 3
+                }        
+            } catch {
+                Write-MyLogger "ERROR! There was an error installing RBS to $Computer. Please try manually" RED
+                #Write-MyLogger "$($error[0].exception.message)" RED
+                Write-MyLogger $LineSepDashes
+                continue    
+            }
+            Remove-PSSession -Session $Session
+            #EndRegion Install the RBS on the Remote Computer
+
+
+
+            #Region remove RBS files
+            Write-MyLogger "Deleting RBS files on $Computer. Please wait" CYAN
+            try {
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    Remove-Item -Path "C:\Temp\RubrikBackupService" -recurse -Force | out-null
+                }
+            } catch {
+                Write-MyLogger "ERROR! There was an error removing RBS installer files. Please try manually" RED
+                #Write-MyLogger "$($error[0].exception.message)" RED
+                Write-MyLogger $LineSepDashes
+                continue
+            }
+            #EndRegion Remove RBS Files
+        }
+        #EndRegion Copy RBS files, Install RBS, Delete RBS Files
+
+
+        #Region Set Run as user. Skip if RBSUserName=LocalSystem
+        if ($RBSUserName -eq "LocalSystem") {
+            Write-MyLogger "Running Rubrik Backup Service as LocalSystem" CYAN
+        } else {
+            #Region adding username to administrators on remote computer
+            if ($SkipAddToAdministratorsGroup) {
+                Write-MyLogger "Skipping adding user $RBSUserName to administrators group" Yellow
+            } else {
+                Start-Sleep 5
+                Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
+                try {
+                    Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                        param ($user)
+                        if ( $(Get-LocalGroupMember administrators).name -contains $user) {
+                            Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
+                        } else {
+                            Add-LocalGroupMember -Group "Administrators" -Member $user
+                        }
+                    } -ArgumentList $RBSUserName
+                } catch {
+                    Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer\Administrators. Please check manually" RED
+                    continue
+                }
+            }
+            #EndRegion adding username to administrators on remote computer
+
+
+            #Region Setting SeServiceLoginRight on remote computer to allow run as a service
+            #From: https://stackoverflow.com/questions/313831/using-powershell-how-do-i-grant-log-on-as-service-to-an-account
+            Write-MyLogger "Granting ""Log on as a Service"" to $RBSUserName on $computer" Cyan
+            try {
+                Invoke-Command -ComputerName $computer -Script {
+                    param(
+                        [string] $username,
+                        [string] $computerName
+                    )
+                    $tempPath = [System.IO.Path]::GetTempPath()
+                    $import = Join-Path -Path $tempPath -ChildPath "import.inf"
+                    if(Test-Path $import) { Remove-Item -Path $import -Force }
+                    $export = Join-Path -Path $tempPath -ChildPath "export.inf"
+                    if(Test-Path $export) { Remove-Item -Path $export -Force }
+                    $secedt = Join-Path -Path $tempPath -ChildPath "secedt.sdb"
+                    if(Test-Path $secedt) { Remove-Item -Path $secedt -Force }
+                    try {
+                        #Write-Host ("  > Granting SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName)
+                        $sid = ((New-Object System.Security.Principal.NTAccount($username)).Translate([System.Security.Principal.SecurityIdentifier])).Value
+                        Write-Host "$using:LineIndentSpaces  > Exporting Local Policy to temp file"
+                        secedit /export /cfg $export | out-null
+                        $sids = (Select-String $export -Pattern "SeServiceLogonRight").Line
+                        if ($sids -match $sid) {
+                            Write-Host "$using:LineIndentSpaces  > User currently granted SeServiceLoginRight - Nothing to do!" -ForegroundColor GREEN
+                        } else {
+                            foreach ($line in @("[Unicode]", 
+                                                "Unicode=yes", 
+                                                "[System Access]", 
+                                                "[Event Audit]", 
+                                                "[Registry Values]", 
+                                                "[Version]", 
+                                                "signature=`"`$CHICAGO$`"", 
+                                                "Revision=1", 
+                                                "[Profile Description]", 
+                                                "Description=GrantLogOnAsAService security template", 
+                                                "[Privilege Rights]", 
+                                                "$sids,*$sid")){
+                                Add-Content $import $line
+                            }
+                            Write-Host "$using:LineIndentSpaces  > Importing Local Policy with updated SeServiceLoginRight"
+                            secedit /import /db $secedt /cfg $import | out-null
+                            Write-Host "$using:LineIndentSpaces  > Applying modified Local Policy"
+                            secedit /configure /db $secedt | out-null
+                            Write-Host "$using:LineIndentSpaces  > Refreshing Group Policy to apply updates to Local Policy"
+                            gpupdate /force | out-null                    
+                            Remove-Item -Path $import -Force | out-null
+                            Remove-Item -Path $secedt -Force | out-null
+                        }
+                        Remove-Item -Path $export -Force | out-null
+                    } catch {
+                        Write-MyLogger ("Failed to grant SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName) RED
+                        $error[0]
+                    }
+                } -ArgumentList ($RBSUserName, $computer)        
+            } catch {
+                Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer ""Log on as a Service"". Please check manually" RED
+                continue
+            }
+            #EndRegion Setting SeServiceLoginRight on remote computer to allow run as a service
+        }
+        #EndRegion Set Run as user. Skip if RBSUserName=LocalSystem
+
+
+
+        #Region OpenFirewall ports (windows builtin firewall only)
+        if ($OpenWindowsFirewall) {
+            #WARNING: Opens Windows Firewall to all IPs
+            try {
+                Write-MyLogger "Adding Firewall Rule for 12800/12801 TCP from any remote IP on all profiles"  Cyan
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    $RBSFirewallRule = @{
+                        DisplayName  = "Rubrik Backup Service"
+                        Profile      = @('Domain', 'Private', 'Public') 
+                        Direction    = 'Inbound'
+                        Action       = 'Allow'
+                        Protocol     = 'TCP'
+                        LocalPort    = @(12800, 12801)
+                    }
+                    if ( Get-NetFirewallRule | Where-Object { $_.displayname -match $RBSFirewallRule.DisplayName } ){
+                        Write-Host "$using:LineIndentSpaces  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
+                    } else {
+                        $result = New-NetFirewallRule @RBSFirewallRule
+                    }
+                } 
+            } catch {
+                Write-MyLogger "ERROR! Could not open windows firewall ports (12800/12801TCP). Please check manually" RED
                 continue
             }
         }
-        #EndRegion adding username to administrators on remote computer
+        #EndRegion OpenFirewall ports (windows firewall only)
 
 
-        #Region Setting SeServiceLoginRight on remote computer to allow run as a service
-        #From: https://stackoverflow.com/questions/313831/using-powershell-how-do-i-grant-log-on-as-service-to-an-account
-        Write-MyLogger "Granting ""Log on as a Service"" to $RBSUserName on $computer" Cyan
-        try {
-            Invoke-Command -ComputerName $computer -Script {
-                param(
-                    [string] $username,
-                    [string] $computerName
-                )
-                $tempPath = [System.IO.Path]::GetTempPath()
-                $import = Join-Path -Path $tempPath -ChildPath "import.inf"
-                if(Test-Path $import) { Remove-Item -Path $import -Force }
-                $export = Join-Path -Path $tempPath -ChildPath "export.inf"
-                if(Test-Path $export) { Remove-Item -Path $export -Force }
-                $secedt = Join-Path -Path $tempPath -ChildPath "secedt.sdb"
-                if(Test-Path $secedt) { Remove-Item -Path $secedt -Force }
-                try {
-                    #Write-Host ("  > Granting SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName)
-                    $sid = ((New-Object System.Security.Principal.NTAccount($username)).Translate([System.Security.Principal.SecurityIdentifier])).Value
-                    Write-Host "$using:LineIndentSpaces  > Exporting Local Policy to temp file"
-                    secedit /export /cfg $export | out-null
-                    $sids = (Select-String $export -Pattern "SeServiceLogonRight").Line
-                    if ($sids -match $sid) {
-                        Write-Host "$using:LineIndentSpaces  > User currently granted SeServiceLoginRight - Nothing to do!" -ForegroundColor GREEN
-                    } else {
-                        foreach ($line in @("[Unicode]", 
-                                            "Unicode=yes", 
-                                            "[System Access]", 
-                                            "[Event Audit]", 
-                                            "[Registry Values]", 
-                                            "[Version]", 
-                                            "signature=`"`$CHICAGO$`"", 
-                                            "Revision=1", 
-                                            "[Profile Description]", 
-                                            "Description=GrantLogOnAsAService security template", 
-                                            "[Privilege Rights]", 
-                                            "$sids,*$sid")){
-                            Add-Content $import $line
-                        }
-                        Write-Host "$using:LineIndentSpaces  > Importing Local Policy with updated SeServiceLoginRight"
-                        secedit /import /db $secedt /cfg $import | out-null
-                        Write-Host "$using:LineIndentSpaces  > Applying modified Local Policy"
-                        secedit /configure /db $secedt | out-null
-                        Write-Host "$using:LineIndentSpaces  > Refreshing Group Policy to apply updates to Local Policy"
-                        gpupdate /force | out-null                    
-                        Remove-Item -Path $import -Force | out-null
-                        Remove-Item -Path $secedt -Force | out-null
-                    }
-                    Remove-Item -Path $export -Force | out-null
-                } catch {
-                    Write-MyLogger ("Failed to grant SeServiceLogonRight to user account: {0} on host: {1}." -f $username, $computerName) RED
-                    $error[0]
+
+        #Region Set RBS to run as service account
+        if ( $RBSUserName -eq "LocalSystem" -and -not $ChangeRBSCredentialOnly ) {
+            Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
+        } else {
+            #Set Service to run as RBSUserName/RBSPassword
+            Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
+            try {
+                Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
+            } catch {
+                Write-MyLogger "ERROR! Did not set the username $RBSUserName properly on $Computer. Please check manually"
+                continue
+            }        
+            #Restart RBS for new credentials to take effect
+            Start-Sleep 5
+            Write-MyLogger "Restarting RBS service on $computer" Cyan
+            try {
+                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    get-service "rubrik backup service" | Stop-Service -ErrorAction stop
+                    Start-Sleep 2
+                    get-service "rubrik backup service" | Start-Service -ErrorAction Stop
                 }
-            } -ArgumentList ($RBSUserName, $computer)        
-        } catch {
-            Write-MyLogger "ERROR! Could not add $RBSUserName to $Computer ""Log on as a Service"". Please check manually" RED
-            continue
-        }
-        #EndRegion Setting SeServiceLoginRight on remote computer to allow run as a service
-    }
-    #EndRegion Set Run as user. Skip if RBSUserName=LocalSystem
-
-
-
-    #Region OpenFirewall ports (windows builtin firewall only)
-    if ($OpenWindowsFirewall) {
-        #WARNING: Opens Windows Firewall to all IPs
-        try {
-            Write-MyLogger "Adding Firewall Rule for 12800/12801 TCP from any remote IP on all profiles"  Cyan
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                $RBSFirewallRule = @{
-                    DisplayName  = "Rubrik Backup Service"
-                    Profile      = @('Domain', 'Private', 'Public') 
-                    Direction    = 'Inbound'
-                    Action       = 'Allow'
-                    Protocol     = 'TCP'
-                    LocalPort    = @(12800, 12801)
-                }
-                if ( Get-NetFirewallRule | Where-Object { $_.displayname -match $RBSFirewallRule.DisplayName } ){
-                    Write-Host "$using:LineIndentSpaces  > WARNING! Rule named $($RBSFirewallRule.DisplayName) already exists. Please check manually" -ForegroundColor YELLOW
-                } else {
-                    $result = New-NetFirewallRule @RBSFirewallRule
-                }
-            } 
-        } catch {
-            Write-MyLogger "ERROR! Could not open windows firewall ports (12800/12801TCP). Please check manually" RED
-            continue
-        }
-    }
-    #EndRegion OpenFirewall ports (windows firewall only)
-
-
-
-    #Region RBSUserName=LocalSystem
-    if ( $RBSUserName -eq "LocalSystem" -and -not $ChangeRBSCredentialOnly ) {
-        Write-MyLogger "RBSUserName set to LocalSystem. Nothing to do" GREEN
-    } else {
-        #Set Service to run as RBSUserName/RBSPassword
-        Write-MyLogger "Setting service to run as $RBSusername on $Computer" CYAN
-        try {
-            Get-CimInstance Win32_Service -computer $Computer -Filter "Name='Rubrik Backup Service'" | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $RBSusername; StartPassword = $RBSPassword } | out-null
-        } catch {
-            Write-MyLogger "ERROR! Did not set the username $RBSUserName properly on $Computer. Please check manually"
-            continue
-        }        
-        #Restart RBS for new credentials to take effect
-        Start-Sleep 5
-        Write-MyLogger "Restarting RBS service on $computer" Cyan
-        try {
-            Invoke-Command -ComputerName $Computer -ScriptBlock { 
-                get-service "rubrik backup service" | Stop-Service 
-                Start-Sleep 2
-                get-service "rubrik backup service" | Start-Service
+            } catch {
+                Write-MyLogger "ERROR! Could not restart service properly on $Computer. Please check manually"
+                continue
             }
-        } catch {
-            Write-MyLogger "ERROR! Could not restart service properly on $Computer. Please check manually"
-            continue
         }
+        #EndRegion Set RBS to run as service account
     }
-    #EndRegion ChangeRBSCredentials *and* RBSUserName=LocalSystem
-
+    #endRegion Install RBS
 
 
     #Region Add Windows Host to RSC
     if ($RubrikClusterObject -and -not $ChangeRBSCredentialOnly) {
         Write-MyLogger "Adding Host to RSC via API" CYAN
-        $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.UUID
-        if ($result.errors) {
-            Write-MyLogger "ERROR! Could not add host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)"
-            Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
-        } else {
+        try {
+            $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.ID
             Write-MyLogger "Success! Added host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)" GREEN
             Write-MyLogger "  > RSC Object ID: " GREEN -NoNewLine
             Write-MyLogger "$($result.data[0].hostSummary.id)" white -NoTimeStamp
+        } catch {
+            Write-MyLogger "ERROR! Could not add host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)" Red
+            Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
+            continue
         }
     }
     #endRegion Add Windows Host to RSC
 
 
+
+    #Region Apply SLA to new SQL objects (standalone SQL only and will recognize Availability Groups--does NOT import Failover Cluster objects)
+    if ($ApplySLAtoSqlObject) {
+        Write-MyLogger "Getting List of registered MSSQL instances registered to " Cyan -NoNewLine
+        Write-MyLogger "$($RubrikClusterObject.Name)/$($RubrikClusterObject.id)" White -NoTimeStamp
+        $i          = 0 
+        $sleeptime  = 10
+        $SleepMax   = 300
+        $sleepTotal = 0
+        do {
+            $i++
+            $sleepTotal += $SleepTime
+            $RscMssqlServers = Get-MyRscMssqlInstances
+            Write-MyLogger "  > Checking if $computer is registered as a MSSQL server in RSC (attempt $i)" Yellow
+            #$CompareResult = Compare-Object -ReferenceObject $RscMssqlServers.Name -DifferenceObject $ComputerName  | Where-Object {$_.sideindicator -eq "=>"}
+            if ( ($RscMssqlServers.Name -notcontains $Computer) -and ($sleepTotal -lt $SleepMax) ) {
+                Write-MyLogger "  > MSSQL server object for $computer not registered yet. Sleeping $sleeptime sec and trying again"
+                Start-Sleep $SleepTime
+            }
+        } until ( ($RscMssqlServers.Name) -contains $Computer -or ($sleepTotal -gt $SleepMax) )
+        if ($sleepTotal -gt $SleepMax) {
+            Write-MyLogger "ERROR! $Computer never appeared in RSC after $SleepTotal seconds. Skipping SLA Assignment" RED
+        } else {
+            #Must've appeared, lets apply the SLA to the new object
+            $RscMssqlServer = $RscMssqlServers | Where-Object {$_.name -eq $Computer}
+            Write-MyLogger "  > MSSQL server object $($RscMssqlServer.Name) found! Registered with $($RubrikClusterObject.Name)" GREEN
+            Write-MyLogger "  > Applying SLA ""$($RscSlaDomainSQL.Name)"" to object" Cyan
+            #Region Mutation and vars
+            $QueryString = '
+            mutation AssignMssqlSLAMutation($input: AssignMssqlSlaDomainPropertiesAsyncInput!) {
+                assignMssqlSlaDomainPropertiesAsync(input: $input) {
+                  items {
+                    objectId
+                    __typename
+                  }
+                  __typename
+                }
+              }
+            '
+
+            $variables = @{
+                input = @{
+                    updateInfo = @{
+                        ids = @(
+                            $RscMssqlServer.ID
+                        )
+                        shouldApplyToExistingSnapshots  = $false
+                        shouldApplyToNonPolicySnapshots = $false
+                        mssqlSlaPatchProperties         = @{
+                            useConfiguredDefaultLogRetention = $false
+                            configuredSlaDomainId            = $RscSlaDomainSQL.id
+                            mssqlSlaRelatedProperties        = @{
+                                copyOnly            = $false
+                                hasLogConfigFromSla = $false
+                                hostLogRetention    = -1
+                            }
+                        }
+                    }
+                }
+            }         
+            #EndRegion Mutation and vars
+            
+            #Apply mutation and variables via Invoke-RSC
+            try {
+                $result = Invoke-Rsc -GqlQuery $QueryString -var $variables
+            } catch {
+                Write-MyLogger "ERROR! there was an error applying the SLA to the object. Please verify manually in RSC"
+                Write-MyLogger "RSC Response: `n$LineIndentSpaces  $($result.errors.message)"
+            }
+        }
+    }
+    #EndRegion Apply SLA to new SQL objects
+
+
+
+
     if ($ChangeRBSCredentialOnly) {
         Write-MyLogger "Changing RBS Credentials on " -NoNewline CYAN
+    } elseif ($SkipRBSinstall) {
+        Write-MyLogger "Register RBS on " -NoNewLine CYAN
     } else {
-        Write-MyLogger "Install of RBS on " -NoNewline CYAN
+        Write-MyLogger "Install of RBS on " -NoNewline GREEN
     }
-    Write-MyLogger "$computer complete" GREEN -NoTimeStamp
+    Write-MyLogger "$computer " White -NoTimeStamp -NoNewLine
+    Write-MyLogger "complete" GREEN -NoTimeStamp
 } 
 #EndRegion Loop Through Computer List
 
+
+
 #Cleanup RBS downloads from $path folder (ie C:\Temp)
-if (-not $ChangeRBSCredentialOnly) {
-    Remove-Item -Path $OutFile -Force | out-null
-    Remove-Item -Path "$path\RubrikBackupService" -Force -recurse | out-null
-}
+#if (-not $ChangeRBSCredentialOnly -or -not $SkipRBSinstall) {
+    Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue | out-null
+    Remove-Item -Path "$path\RubrikBackupService" -Force -recurse -ErrorAction SilentlyContinue| out-null
+#}
 
 
 
@@ -847,6 +1074,6 @@ if ($RSCserviceAccountXML) {
     Disconnect-Rsc | out-null
 }
 & $EndSummary_scriptBlock
-$progressPreference = $oldProgressPreference 
+$Global:progressPreference = $oldProgressPreference 
 
 #EndRegion Main Script
