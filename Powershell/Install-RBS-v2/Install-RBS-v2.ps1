@@ -92,6 +92,7 @@ param(
     [switch]$ChangeRBSCredentialOnly,
 
     #Skip RBS install, skip RBS user/pw change, register with RSC only
+    #assumes RBS was installed and is fuctioning through some other mechanism, such as Ansible, SCCM, etc
     [switch]$SkipRBSinstall,
 
     #Create rule to Open Windows Firewall ports (12800/12801 TCP). Creates explicit rule for source ANY to host
