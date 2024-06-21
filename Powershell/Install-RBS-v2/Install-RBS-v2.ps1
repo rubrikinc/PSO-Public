@@ -530,7 +530,7 @@ if ($ChangeRBSCredentialOnly) {
             Write-MyLogger "Found Cluster with ID $RubrikCluster and name of $($RSCRubrikClusters.Name)"
             $RubrikCluster = $RSCRubrikClusters.Name
         } else {
-            Write-MyLogger "Found Cluster named ""$RubrikCluster"""
+            Write-MyLogger "Found Cluster matching name ""$RubrikCluster"""
         }
         $RubrikClusterObject = $RSCRubrikClusters
     } else {
@@ -685,7 +685,11 @@ if ($SkipRBSinstall) {
     #If using RSC to register, use the first IP from the cluster (cant guarantee name in RSC is resolvable)
     #If not using RSC, then just use the value from input of cluster (could be DNS or IP)
     if ($RubrikClusterObject) {
-        $url =  "https://$($RubrikClusterObject.IPAddress0)/connector/RubrikBackupService.zip"
+        if ($RubrikClusterObject.DefaultAddress) {
+            $url =  "https://$($RubrikClusterObject.DefaultAddress)/connector/RubrikBackupService.zip"
+        } else {
+            $url =  "https://$($RubrikClusterObject.IPAddress0)/connector/RubrikBackupService.zip"
+        }
     } else {
         $url =  "https://$($RubrikCluster)/connector/RubrikBackupService.zip"
     }
