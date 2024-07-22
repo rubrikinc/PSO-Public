@@ -98,8 +98,8 @@ param(
     #Create rule to Open Windows Firewall ports (12800/12801 TCP). Creates explicit rule for source ANY to host
     [switch]$OpenWindowsFirewall,
 
-    #Local Location to store download of RBS
-    [string]$Path = "c:\temp",
+    ##Local Location to store download of RBS
+    #[string]$Path = "c:\temp",
 
     # Path to Service account XML file. Must be created using Set-RSCServiceAccountFile from RubrikSecurityCloud PS Module
     [string] $RSCserviceAccountXML,
@@ -679,9 +679,6 @@ Write-MyLogger $LineSepHashesFull CYAN -NoTimeStamp
 if ($SkipRBSinstall) {
     Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS download" YELLOW
 } elseif (-not $ChangeRBSCredentialOnly) {
-    if (-not (test-path  $Path) ) {
-        $null = New-Item -Path $Path -ItemType Directory 
-    }
     #If using RSC to register, use the first IP from the cluster (cant guarantee name in RSC is resolvable)
     #If not using RSC, then just use the value from input of cluster (could be DNS or IP)
     if ($RubrikClusterObject) {
@@ -693,19 +690,20 @@ if ($SkipRBSinstall) {
     } else {
         $url =  "https://$($RubrikCluster)/connector/RubrikBackupService.zip"
     }
-    $OutFile = "$Path\RubrikBackupService.zip"
+    $RBSTempFile = New-TemporaryFile
+    $RBSTempPath = "$($RBSTempFile.DirectoryName)\$($RBSTempFile.BaseName)"
 
     Write-MyLogger "Downloading RBS zip file from $url" CYAN
-    Write-MyLogger "Saving as $OutFile" CYAN
+    Write-MyLogger "Saving as $($RBSTempFile.FullName)" CYAN
 
     try {
-        $null = Invoke-WebRequest -Uri $url -OutFile $OutFile -SkipCertificateCheck
+        $null = Invoke-WebRequest -Uri $url -OutFile $RBSTempFile -SkipCertificateCheck
     } catch {
         Write-MyLogger "ERROR! Could not download RBS zip file from $RubrikCluster. Please verify connectivity" Red
         exit 1
     }
-    Write-MyLogger "Expanding RBS locally to c:\Temp\RubrikBackupService\" CYAN
-    Expand-Archive -LiteralPath $OutFile -DestinationPath "$path\RubrikBackupService" -Force
+    Write-MyLogger "Expanding RBS locally to $RBSTempPath" CYAN
+    Expand-Archive -LiteralPath $RBSTempFile -DestinationPath $RBSTempPath -Force
 }
 #endregion
 
@@ -747,7 +745,7 @@ foreach($Computer in $($ComputerName -split ',')){
                     New-Item -Path "C:\Temp\RubrikBackupService" -type directory -Force | out-null
                 }
                 $Session = New-PSSession -ComputerName $Computer 
-                foreach ($file in Get-ChildItem C:\Temp\RubrikBackupService) {
+                foreach ($file in Get-ChildItem $RBSTempPath) {
                     Write-MyLogger "  > Copying $file to $computer"
                     Copy-Item -ToSession $Session $file -Destination C:\Temp\RubrikBackupService | out-Null
                 }
@@ -952,7 +950,10 @@ foreach($Computer in $($ComputerName -split ',')){
 
     #Region Add Windows Host to RSC
     if ($RubrikClusterObject -and -not $ChangeRBSCredentialOnly) {
-        Write-MyLogger "Adding Host to RSC via API" CYAN
+        Write-MyLogger "Adding $Computer to $($RubrikClusterObject.Name) via API" CYAN
+        #Write-MyLogger "Hostname    : $Computer" MAGENTA
+        #Write-MyLogger "Cluster Name: $($RubrikClusterObject.Name)" MAGENTA
+        #Write-MyLogger "Cluster UUID: $($RubrikClusterObject.ID)"   MAGENTA
         try {
             $result = New-Host -inputHost $Computer -ClusterUuid $RubrikClusterObject.ID
             Write-MyLogger "Success! Added host $Computer to Rubrik Cluster $($RubrikClusterObject.Name)" GREEN
@@ -1057,11 +1058,7 @@ foreach($Computer in $($ComputerName -split ',')){
 
 
 
-#Cleanup RBS downloads from $path folder (ie C:\Temp)
-#if (-not $ChangeRBSCredentialOnly -or -not $SkipRBSinstall) {
-    Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue | out-null
-    Remove-Item -Path "$path\RubrikBackupService" -Force -recurse -ErrorAction SilentlyContinue| out-null
-#}
+
 
 
 
@@ -1072,6 +1069,12 @@ Write-MyLogger "Script Complete!" GREEN
 If ($log) {
     Write-MyLogger "Log file can be found at $logfile" GREEN
 }
+
+#Cleanup RBS downloads from Temp folder 
+Write-MyLogger "Cleaning up and removing downloaded RBS installer and temp folder" GREEN
+Remove-Item -Path $RBSTempFile -Force -ErrorAction SilentlyContinue | out-null
+Remove-Item -Path $RBSTempPath -Force -recurse -ErrorAction SilentlyContinue| out-null
+
 #Disconnect from RSC, if connected
 if ($RSCserviceAccountXML) {
     Write-MyLogger "Disconnecting from RSC" GREEN
