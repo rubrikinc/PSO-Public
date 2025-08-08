@@ -26,6 +26,9 @@
     ADDED 2024.03.11 - Can apply SLA to SQL Object that is automaticaly added to RSC when RBS discovers SQL
     - use "ApplySLAtoSqlObject" command line argument to pass the name or UUID of the SLA to apply to SQL
 
+    ADDED 2025.08.07 - $RemoteCreds CLI arg. Can supply credentials different than logged on creds for remote server
+     - Useful when remote windows host is in a different domain
+     - or the logged on user does not have access to remote server
 
 .NOTES
     Updated 2023.08.26 by David Oslager for community usage
@@ -110,6 +113,10 @@ param(
 
     # Shows details from RSC GraphQL searches-similar to Verbose, but without the builtin verbose statements, used for debugging
     [switch] $ShowDetails,
+
+
+    # Credentials for remote server if current logged on user does not have access. Must be PScredential type. 
+    [pscredential] $RemoteCreds,
 
     # Create Log file of output
     [switch] $log,
@@ -715,6 +722,15 @@ if ($SkipRBSinstall) {
 foreach($Computer in $($ComputerName -split ',')){
     #Region Install RBS
     Write-MyLogger $LineSepDashes
+
+    #Define splat for PS Session parameters. Add Credential for RemoteCreds if var exists
+    $SessionParams = @{
+        ComputerName  = $Computer
+    }
+    if ($RemoteCreds) { 
+        $SessionParams.add("Credential",$RemoteCreds) 
+    }
+
     if ($SkipRBSinstall) {
         Write-MyLogger "SkipRBSInstall specified on command line, skipping RBS install" YELLOW
     } else {
@@ -741,10 +757,10 @@ foreach($Computer in $($ComputerName -split ',')){
             #region Copy the RubrikBackupService files to the remote computer
             Write-MyLogger "Copying RBS files to $Computer. Please wait" CYAN
             try {
-                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                $Session = New-PSSession @SessionParams
+                Invoke-Command -Session $Session -ScriptBlock { 
                     New-Item -Path "C:\Temp\RubrikBackupService" -type directory -Force | out-null
                 }
-                $Session = New-PSSession -ComputerName $Computer 
                 foreach ($file in Get-ChildItem $RBSTempPath) {
                     Write-MyLogger "  > Copying $file to $computer"
                     Copy-Item -ToSession $Session $file -Destination C:\Temp\RubrikBackupService | out-Null
@@ -762,7 +778,7 @@ foreach($Computer in $($ComputerName -split ',')){
 
             #Region Install the RBS on the Remote Computer
             Write-MyLogger "Installing RBS on $Computer. Please wait" CYAN
-            $Session = New-PSSession -ComputerName $Computer 
+            $Session = New-PSSession @SessionParams
             try {
                 Invoke-Command -Session $Session -ScriptBlock {
                     Start-Process -FilePath "C:\Temp\RubrikBackupService\RubrikBackupService.msi" -ArgumentList "/quiet" -Wait
@@ -783,7 +799,8 @@ foreach($Computer in $($ComputerName -split ',')){
             #Region remove RBS files
             Write-MyLogger "Deleting RBS files on $Computer. Please wait" CYAN
             try {
-                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                $Session = New-PSSession @SessionParams
+                Invoke-Command -Session $Session -ScriptBlock { 
                     Remove-Item -Path "C:\Temp\RubrikBackupService" -recurse -Force | out-null
                 }
             } catch {
@@ -792,6 +809,7 @@ foreach($Computer in $($ComputerName -split ',')){
                 Write-MyLogger $LineSepDashes
                 continue
             }
+            Remove-PSSession -Session $Session
             #EndRegion Remove RBS Files
         }
         #EndRegion Copy RBS files, Install RBS, Delete RBS Files
@@ -808,7 +826,8 @@ foreach($Computer in $($ComputerName -split ',')){
                 Start-Sleep 5
                 Write-MyLogger "Adding $RBSUserName to administrators on $computer" Cyan
                 try {
-                    Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                    $Session = New-PSSession @SessionParams
+                    Invoke-Command -Session $Session -ScriptBlock { 
                         param ($user)
                         if ( $(Get-LocalGroupMember administrators).name -contains $user) {
                             Write-Host "$using:LineIndentSpaces  > User $user is already a member of the Administrators Group. Nothing to do" -ForegroundColor GREEN
@@ -828,7 +847,8 @@ foreach($Computer in $($ComputerName -split ',')){
             #From: https://stackoverflow.com/questions/313831/using-powershell-how-do-i-grant-log-on-as-service-to-an-account
             Write-MyLogger "Granting ""Log on as a Service"" to $RBSUserName on $computer" Cyan
             try {
-                Invoke-Command -ComputerName $computer -Script {
+                $Session = New-PSSession @SessionParams
+                Invoke-Command -Session $Session -Script {
                     param(
                         [string] $username,
                         [string] $computerName
@@ -884,6 +904,7 @@ foreach($Computer in $($ComputerName -split ',')){
             }
             #EndRegion Setting SeServiceLoginRight on remote computer to allow run as a service
         }
+        Remove-PSSession -Session $Session
         #EndRegion Set Run as user. Skip if RBSUserName=LocalSystem
 
 
@@ -893,7 +914,8 @@ foreach($Computer in $($ComputerName -split ',')){
             #WARNING: Opens Windows Firewall to all IPs
             try {
                 Write-MyLogger "Adding Firewall Rule for 12800/12801 TCP from any remote IP on all profiles"  Cyan
-                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                $Session = New-PSSession @SessionParams
+                Invoke-Command -Session $Session -ScriptBlock { 
                     $RBSFirewallRule = @{
                         DisplayName  = "Rubrik Backup Service"
                         Profile      = @('Domain', 'Private', 'Public') 
@@ -913,6 +935,7 @@ foreach($Computer in $($ComputerName -split ',')){
                 continue
             }
         }
+        Remove-PSSession -Session $Session
         #EndRegion OpenFirewall ports (windows firewall only)
 
 
@@ -933,7 +956,8 @@ foreach($Computer in $($ComputerName -split ',')){
             Start-Sleep 5
             Write-MyLogger "Restarting RBS service on $computer" Cyan
             try {
-                Invoke-Command -ComputerName $Computer -ScriptBlock { 
+                $Session = New-PSSession @SessionParams
+                Invoke-Command -Session $Session -ScriptBlock { 
                     get-service "rubrik backup service" | Stop-Service -ErrorAction stop
                     Start-Sleep 2
                     get-service "rubrik backup service" | Start-Service -ErrorAction Stop
@@ -943,6 +967,7 @@ foreach($Computer in $($ComputerName -split ',')){
                 continue
             }
         }
+        Remove-PSSession -Session $Session
         #EndRegion Set RBS to run as service account
     }
     #endRegion Install RBS
